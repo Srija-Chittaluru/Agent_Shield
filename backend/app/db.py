@@ -251,6 +251,37 @@ def init_schema() -> None:
             INTEGER REFERENCES agent_flows(id);
         ALTER TABLE test_cases ADD COLUMN IF NOT EXISTS node_id TEXT;
         ALTER TABLE test_cases ADD COLUMN IF NOT EXISTS node_script_json TEXT;
+
+        -- Flow-level scenario planning: a candidate path through one uploaded flow, as
+        -- produced by app.core.flow_graph.generate_candidate_paths() and explicitly
+        -- saved by the user (previewing never writes here). References the flow by id
+        -- and stores only the path itself — node/edge definitions stay in agent_flows.
+        -- Not a test case and not runnable: nothing here is wired to test_cases,
+        -- scenarios, or execution yet.
+        --
+        -- scenario_key is a deterministic hash of the ordered path, so saving the same
+        -- plan twice is a no-op (UNIQUE + ON CONFLICT DO NOTHING) rather than a
+        -- duplicate or a replacement. test_goal stays NULL until a later phase writes one.
+        CREATE TABLE IF NOT EXISTS flow_scenarios (
+            id                      SERIAL PRIMARY KEY,
+            flow_id                 INTEGER NOT NULL REFERENCES agent_flows(id) ON DELETE CASCADE,
+            scenario_key            TEXT NOT NULL,
+            category                TEXT NOT NULL,   -- happy_path | primary_path | branch | terminal | retry | recovery
+            name                    TEXT NOT NULL,
+            test_goal               TEXT,
+            path_json               TEXT NOT NULL,   -- ["node_id", ...] in traversal order
+            covered_edges_json      TEXT NOT NULL,   -- [["from", "to"], ...]
+            covered_terminals_json  TEXT NOT NULL,   -- ["node_id", ...]
+            contains_retry          BOOLEAN NOT NULL,
+            created_at              TEXT NOT NULL,
+            UNIQUE (flow_id, scenario_key)
+        );
+
+        -- The reviewed conversation script for a saved flow scenario:
+        -- [{"step", "node_id", "expected_agent_behavior", "caller_line"}, ...] — see
+        -- app.core.node_script.validate_path_script. NULL for a scenario saved as a plan
+        -- only (no script yet).
+        ALTER TABLE flow_scenarios ADD COLUMN IF NOT EXISTS script_json TEXT;
         """
     )
     conn.commit()
@@ -1008,6 +1039,91 @@ def get_agent_flow(flow_id: int) -> dict | None:
     row = conn.execute("SELECT * FROM agent_flows WHERE id = %s", (flow_id,)).fetchone()
     conn.close()
     return row
+
+
+def insert_flow_scenarios(flow_id: int, scenarios: list[dict]) -> int:
+    """Save planned flow scenarios for one flow, in one transaction. Additive and
+    idempotent: a scenario whose (flow_id, scenario_key) is already stored is skipped,
+    never overwritten or duplicated. Returns how many rows were newly inserted.
+
+    Each scenario dict carries: id (-> scenario_key), category, name, path,
+    covered_edges, covered_terminals, contains_retry — the preview response's shape.
+    """
+    conn = get_conn()
+    inserted = 0
+    ts = now_iso()
+    for s in scenarios:
+        cur = conn.execute(
+            """INSERT INTO flow_scenarios
+               (flow_id, scenario_key, category, name, test_goal, path_json,
+                covered_edges_json, covered_terminals_json, contains_retry, created_at)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+               ON CONFLICT (flow_id, scenario_key) DO NOTHING""",
+            (flow_id, s["id"], s["category"], s["name"], s.get("test_goal"),
+             _json.dumps(s["path"]), _json.dumps(s["covered_edges"]),
+             _json.dumps(s["covered_terminals"]), bool(s["contains_retry"]), ts),
+        )
+        inserted += cur.rowcount
+    conn.commit()
+    conn.close()
+    return inserted
+
+
+def get_flow_scenario(flow_id: int, scenario_key: str) -> dict | None:
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT * FROM flow_scenarios WHERE flow_id = %s AND scenario_key = %s",
+        (flow_id, scenario_key),
+    ).fetchone()
+    conn.close()
+    return row
+
+
+def upsert_flow_scenario_script(flow_id: int, scenario: dict, test_goal: str, turns: list[dict]) -> dict:
+    """Save one scenario with its reviewed script: inserts the scenario if it isn't
+    saved yet, otherwise updates ONLY its test_goal/script — path, category and name
+    are never rewritten. Same (flow_id, scenario_key) key as insert_flow_scenarios, so
+    repeated saves converge on one row. Returns the stored row."""
+    conn = get_conn()
+    row = conn.execute(
+        """INSERT INTO flow_scenarios
+           (flow_id, scenario_key, category, name, test_goal, path_json,
+            covered_edges_json, covered_terminals_json, contains_retry, created_at, script_json)
+           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+           ON CONFLICT (flow_id, scenario_key) DO UPDATE
+               SET test_goal = EXCLUDED.test_goal, script_json = EXCLUDED.script_json
+           RETURNING *""",
+        (flow_id, scenario["id"], scenario["category"], scenario["name"], test_goal,
+         _json.dumps(scenario["path"]), _json.dumps(scenario["covered_edges"]),
+         _json.dumps(scenario["covered_terminals"]), bool(scenario["contains_retry"]),
+         now_iso(), _json.dumps(turns)),
+    ).fetchone()
+    conn.commit()
+    conn.close()
+    return row
+
+
+def delete_flow_scenario(flow_id: int, scenario_key: str) -> bool:
+    """Remove one saved flow scenario (and its script). Touches nothing else — not the
+    flow, not test_cases, not runs. Returns whether a row was deleted."""
+    conn = get_conn()
+    cur = conn.execute(
+        "DELETE FROM flow_scenarios WHERE flow_id = %s AND scenario_key = %s",
+        (flow_id, scenario_key),
+    )
+    conn.commit()
+    conn.close()
+    return cur.rowcount > 0
+
+
+def list_flow_scenarios(flow_id: int) -> list[dict]:
+    """Every saved scenario for this flow, in the order it was saved."""
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT * FROM flow_scenarios WHERE flow_id = %s ORDER BY id", (flow_id,)
+    ).fetchall()
+    conn.close()
+    return rows
 
 
 if __name__ == "__main__":

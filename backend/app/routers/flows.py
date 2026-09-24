@@ -8,19 +8,42 @@ same AgentTestWorkflow/RunGroupWorkflow, activities, scripted runner
 every other test uses. This module adds no second voice-testing engine; see
 app.core.node_script.to_scenario_dict for how a script becomes that existing shape.
 """
+import hashlib
 import json as _json
+import re
 
+import yaml
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.config import TEMPORAL_TASK_QUEUE, WORK_CONCURRENCY
+from app.core.flow_graph import (
+    BRANCH,
+    DEFAULT_MAX_SCENARIOS,
+    HAPPY_PATH,
+    HARD_MAX_SCENARIOS,
+    PRIMARY_PATH,
+    RECOVERY,
+    RETRY,
+    TERMINAL,
+    analyze_graph,
+    generate_candidate_paths,
+)
 from app.core.flow_llm_extractor import FlowExtractionError, extract_flow_with_llm
-from app.core.flow_parser import FlowAmbiguousError, FlowParseError, parse_flow
+from app.core.flow_parser import FlowAmbiguousError, FlowParseError, is_modular_step_flow, parse_flow
+from app.core.flow_scenario_planner import plan_flow_scenarios
+from app.core.voice_native_ws import call_template_variables, check_call_variables
 from app.core.node_script import (
     NodeScriptError,
+    generate_interrupt_script,
     generate_node_script,
+    generate_path_script,
+    interrupt_script_to_scenario,
+    path_script_to_scenario,
     prerequisite_path,
     to_scenario_dict,
+    validate_interrupt_script,
+    validate_path_script,
     validate_script,
 )
 from app.core.scenarios import normalize_scenarios
@@ -28,17 +51,22 @@ from app.temporal.client import get_client
 from app.temporal.workflows import AgentTestInput, RunGroupInput, RunGroupWorkflow
 from app.db import (
     default_customer_agent,
+    delete_flow_scenario,
     get_agent,
     get_agent_flow,
+    get_flow_scenario,
     get_customer_agent_by_agent_id,
     get_test_case,
     insert_agent_flow,
+    insert_flow_scenarios,
     insert_run,
     insert_run_group,
     insert_test_case,
     list_agent_flows,
+    list_flow_scenarios,
     update_run,
     update_test_case,
+    upsert_flow_scenario_script,
 )
 
 router = APIRouter(tags=["flows"])
@@ -347,8 +375,25 @@ async def run_node_test(flow_id: int, node_id: str, test_id: int) -> dict:
         "node_script_json": test_case["node_script_json"],
     }
 
+    run_id, group_id = await _start_single_scenario_run(
+        agent["id"], test_case["customer_agent_id"], scenario
+    )
+    return {
+        "run_id": run_id, "group_id": group_id,
+        "flow_id": flow_id, "node_id": node_id, "test_id": test_id,
+    }
+
+
+async def _start_single_scenario_run(
+    agent_id: int, customer_agent_id: int | None, scenario: dict
+) -> tuple[int, int]:
+    """Submit ONE scenario through the existing RunGroupWorkflow / AgentTestWorkflow —
+    a batch of one, exactly as a node test has always been run. Shared by node tests
+    and flow scenarios so both use the identical execution path. Returns
+    (run_id, group_id); raises 503 (and marks the run errored) if Temporal is down.
+    """
     group_id = insert_run_group()
-    run_id = insert_run(agent["id"], group_id, test_case["customer_agent_id"])
+    run_id = insert_run(agent_id, group_id, customer_agent_id)
 
     try:
         client = await get_client()
@@ -357,7 +402,7 @@ async def run_node_test(flow_id: int, node_id: str, test_id: int) -> dict:
             RunGroupInput(
                 group_id=group_id,
                 targets=[AgentTestInput(
-                    run_id=run_id, agent_id=agent["id"], scenarios=[scenario],
+                    run_id=run_id, agent_id=agent_id, scenarios=[scenario],
                     # The sole run in this batch — it may use the worker's whole share.
                     work_share=WORK_CONCURRENCY,
                 )],
@@ -380,8 +425,739 @@ async def run_node_test(flow_id: int, node_id: str, test_id: int) -> dict:
                 f"({type(e).__name__}). Start it with: temporal server start-dev"
             ),
         ) from e
+    return run_id, group_id
 
+
+# ---------------------------------------------------------------------------
+# Flow-level scenario planning (Phase B): deterministic preview + explicit save.
+#
+# app.core.flow_graph is the ONLY path planner — these endpoints just load a stored
+# flow, hand its nodes/edges to it, and attach an id and a display name to each
+# candidate. No LLM, no test_cases, no runs. Preview never writes; saving is a
+# separate explicit POST that is additive and idempotent.
+# ---------------------------------------------------------------------------
+# Structural labels only — they describe the kind of path, never what it means for
+# the conversation (e.g. a branch is never called "Incorrect Name"). Semantic naming
+# is left to the later LLM script-generation phase.
+SCENARIO_NAMES = {
+    HAPPY_PATH: "Happy Path",
+    PRIMARY_PATH: "Primary Path",
+    BRANCH: "Branch Scenario",
+    TERMINAL: "Terminal Scenario",
+    RETRY: "Retry Loop",
+    RECOVERY: "Retry / Recovery",
+}
+
+
+class ScenarioPlanRequest(BaseModel):
+    max_scenarios: int = Field(DEFAULT_MAX_SCENARIOS, ge=1, le=HARD_MAX_SCENARIOS)
+
+
+class SaveScenariosRequest(BaseModel):
+    """Save the reviewed plan. With `scenario_ids` (ids from a preview), exactly those
+    scenarios are saved; without it, the whole plan for `max_scenarios` is."""
+    scenario_ids: list[str] | None = None
+    max_scenarios: int = Field(DEFAULT_MAX_SCENARIOS, ge=1, le=HARD_MAX_SCENARIOS)
+
+
+def _load_flow_graph(flow_id: int) -> tuple[dict, dict]:
+    """(flow row, {"nodes", "edges"}) for a stored flow — 404 if missing, 422 if its
+    stored graph is malformed.
+
+    Uses the stored nodes_json/edges_json, which ARE the flow parser's normalized output
+    (or LLM-extracted output validated by the parser's own rules at upload time).
+    raw_source is deliberately not re-parsed: for a flow that needed LLM extraction,
+    that would call the LLM again.
+    """
+    flow = get_agent_flow(flow_id)
+    if flow is None:
+        raise HTTPException(status_code=404, detail=f"flow {flow_id} not found")
+    try:
+        nodes = _json.loads(flow["nodes_json"])
+        edges = _json.loads(flow["edges_json"])
+    except (TypeError, ValueError):
+        raise HTTPException(
+            status_code=422, detail={"errors": [f"flow {flow_id} has an unreadable stored graph."]}
+        )
+    errors: list[str] = []
+    if not isinstance(nodes, list) or not all(
+        isinstance(n, dict) and n.get("id") not in (None, "") for n in nodes
+    ):
+        errors.append("stored nodes must be a list of objects that each have an 'id'.")
+    if not isinstance(edges, list) or not all(
+        isinstance(e, dict) and e.get("from") not in (None, "") and e.get("to") not in (None, "")
+        for e in edges
+    ):
+        errors.append("stored edges must be a list of objects that each have 'from' and 'to'.")
+    if errors:
+        raise HTTPException(status_code=422, detail={"errors": errors})
+    return flow, {"nodes": nodes, "edges": edges}
+
+
+def _scenario_key(path: list[str]) -> str:
+    """Deterministic id from the ordered path. The planner never returns two identical
+    paths for one flow, so this is unique per flow — and stable across calls."""
+    return hashlib.sha1(_json.dumps(path).encode()).hexdigest()[:16]
+
+
+def _plan_scenarios(graph: dict, max_scenarios: int) -> list[dict]:
+    """flow_graph's candidates, unchanged, plus an `id` and a display `name`.
+
+    A repeated category is numbered by order of appearance ("Branch Scenario",
+    "Branch Scenario 2", ...). Because the planner's output for a smaller cap is a
+    prefix of its output for a larger one, ids AND names are the same in every preview
+    regardless of max_scenarios.
+    """
+    seen: dict[str, int] = {}
+    scenarios = []
+    for candidate in generate_candidate_paths(graph, max_scenarios):
+        category = candidate["category"]
+        seen[category] = seen.get(category, 0) + 1
+        base = SCENARIO_NAMES.get(category, category.replace("_", " ").title())
+        scenarios.append({
+            "id": _scenario_key(candidate["path"]),
+            "name": base if seen[category] == 1 else f"{base} {seen[category]}",
+            **candidate,
+        })
+    return scenarios
+
+
+def _stored_scenario(row: dict) -> dict:
+    path = _json.loads(row["path_json"])
     return {
-        "run_id": run_id, "group_id": group_id,
-        "flow_id": flow_id, "node_id": node_id, "test_id": test_id,
+        "id": row["scenario_key"],
+        "scenario_row_id": row["id"],
+        "category": row["category"],
+        "name": row["name"],
+        "test_goal": row["test_goal"],
+        "path": path,
+        "covered_edges": _json.loads(row["covered_edges_json"]),
+        "covered_terminals": _json.loads(row["covered_terminals_json"]),
+        "contains_retry": row["contains_retry"],
+        "path_length": len(path),
+        "created_at": row["created_at"],
+        **_stored_script(row.get("script_json")),
     }
+
+
+def _stored_script(script_json: str | None) -> dict:
+    """The saved script. A path script is stored as its turns list (Phase D); an
+    interrupt script as {"turns", "setup", "expectations"} in the same column."""
+    script = _json.loads(script_json) if script_json else None
+    if isinstance(script, dict):
+        return {"turns": script.get("turns"), "setup": script.get("setup"), "expectations": script.get("expectations")}
+    return {"turns": script}
+
+
+# ---------------------------------------------------------------------------
+# Interrupt scenarios (whole-flow planning): a modular flow's stored raw source is
+# re-parsed deterministically to recover its interrupts, then planned by
+# app.core.flow_scenario_planner. Scripts: _generate_interrupt_draft / _save_interrupt_script;
+# runs: _run_interrupt_scenario.
+# ---------------------------------------------------------------------------
+INTERRUPT_CATEGORY = "interrupt"
+INTERRUPT_NO_SCRIPT = "Interrupt scenarios do not support script generation yet."
+INTERRUPT_NO_RUN = "This interrupt scenario has no saved script — generate and save one before running."
+
+
+def _modular_source(flow: dict) -> bool:
+    """True iff this stored flow's raw source is a modular step flow that may be
+    re-parsed deterministically. Never for an LLM-extracted flow: re-parsing it would
+    call the LLM again."""
+    if (flow.get("extraction_method") or "deterministic") == "llm" or not flow.get("raw_source"):
+        return False
+    try:
+        return is_modular_step_flow(yaml.safe_load(flow["raw_source"]))
+    except yaml.YAMLError:
+        return False
+
+
+def _load_planning_graph(flow_id: int) -> tuple[dict, dict, list | None]:
+    """(flow row, graph, interrupts) for whole-flow planning.
+
+    Not a modular flow: the stored graph, interrupts None — exactly what every endpoint
+    used before. Modular flow: a fresh deterministic parse of the stored raw source,
+    which must describe the SAME graph as the stored one (same node ids in order, same
+    edges in order); otherwise 409 rather than planning against a different graph.
+    Nothing is written.
+    """
+    flow, stored = _load_flow_graph(flow_id)
+    if not _modular_source(flow):
+        return flow, stored, None
+    try:
+        fresh = parse_flow(flow["raw_source"], flow.get("source_format"))
+    except (FlowParseError, FlowAmbiguousError) as e:
+        errors = getattr(e, "errors", None) or [str(e)]
+        raise HTTPException(status_code=422, detail={"errors": errors}) from e
+
+    stored_ids = [str(n["id"]) for n in stored["nodes"]]
+    fresh_ids = [str(n["id"]) for n in fresh["nodes"]]
+    stored_edges = [(str(e["from"]), str(e["to"])) for e in stored["edges"]]
+    fresh_edges = [(str(e["from"]), str(e["to"])) for e in fresh["edges"]]
+    if stored_ids != fresh_ids or stored_edges != fresh_edges:
+        raise HTTPException(
+            status_code=409,
+            detail={"errors": [
+                f"flow {flow_id}'s stored graph ({len(stored_ids)} nodes, {len(stored_edges)} edges) "
+                f"no longer matches its source ({len(fresh_ids)} nodes, {len(fresh_edges)} edges). "
+                "Re-upload the flow to refresh it."
+            ]},
+        )
+    return flow, {"nodes": fresh["nodes"], "edges": fresh["edges"]}, fresh.get("interrupts", [])
+
+
+def _interrupt_scenario_key(interrupt_key: str, step: str | None, base_path: list[str]) -> str:
+    """Deterministic id from the interrupt's identity, where it is injected, and the
+    base path — never the path alone, so interrupts sharing a path (every `end`
+    interrupt fired at the same caller turn) cannot collide. Same convention as
+    _scenario_key."""
+    identity = {"interrupt": interrupt_key, "at": step, "base": base_path}
+    return hashlib.sha1(_json.dumps(identity, sort_keys=True).encode()).hexdigest()[:16]
+
+
+def _interrupt_scenarios(graph: dict, interrupts: list) -> tuple[dict | None, list[dict]]:
+    """(base path info, every interrupt scenario) for a modular flow's graph."""
+    plan = plan_flow_scenarios({**graph, "interrupts": interrupts}, HARD_MAX_SCENARIOS)
+    base = plan["base"]
+    base_path = base["path"] if base else []
+    base_info = None
+    if base is not None:
+        base_scenario = _plan_scenarios(graph, HARD_MAX_SCENARIOS)[base["candidate_index"]]
+        base_info = {"scenario_id": base_scenario["id"], "name": base_scenario["name"], "path": base_path}
+
+    terminals = set(analyze_graph(graph).terminals)
+    items = []
+    for s in plan["interrupt_scenarios"]:
+        key = s["interrupt"]["id"]
+        item = {
+            **s,
+            "id": _interrupt_scenario_key(key, s["placement"].get("step"), base_path),
+            "name": key.replace("_", " ").title(),
+            "category": INTERRUPT_CATEGORY,
+        }
+        if s["plannable"]:
+            step_segments = [g["steps"] for g in s["segments"] if "steps" in g]
+            item["covered_terminals"] = [n for n in s["path"] if n in terminals]
+            # A resume revisits the interrupted step by design; only a repeat WITHIN a
+            # segment is a graph retry.
+            item["contains_retry"] = any(len(steps) != len(set(steps)) for steps in step_segments)
+        items.append(item)
+    return base_info, items
+
+
+def _is_planned_interrupt(flow_id: int, scenario_id: str) -> bool:
+    """Whether `scenario_id` names one of this flow's (unsaved) interrupt scenarios."""
+    try:
+        _, graph, interrupts = _load_planning_graph(flow_id)
+    except HTTPException:
+        return False
+    if interrupts is None:
+        return False
+    return any(s["id"] == scenario_id for s in _interrupt_scenarios(graph, interrupts)[1])
+
+
+# Any `user.<field>` the flow references — in prompt placeholders ({user.first_name})
+# or in conditions (answer.dob == user.dob).
+_RECORD_FIELD = re.compile(r"\b(user\.[A-Za-z_][A-Za-z0-9_]*)")
+READBACK_FIELD_TYPES = ("date", "address")
+
+
+def _modular_details(flow: dict) -> dict:
+    """Facts about each step of a modular flow's stored source, for prompting and
+    validation: kind, what the agent asks/says, the field it collects, and the call
+    status if it ends there. Plus which steps allow a readback — an ask step whose
+    declared field type is date/address, or that declares a `readback` prompt — and the
+    `user.*` record fields the flow's prompts reference."""
+    raw = flow["raw_source"]
+    doc = yaml.safe_load(raw)
+    lang = doc.get("default_language") or next(iter(doc.get("languages") or []), None)
+
+    def text(block):
+        return (block.get("text") or block.get("intent") or "").strip() if isinstance(block, dict) else ""
+
+    details, readback_steps = {}, set()
+    for step in doc["steps"]:
+        prompt = (step.get("prompt") or {}).get(lang) or {}
+        d = {"kind": step.get("kind")}
+        if text(prompt.get("ask")):
+            d["ask"] = text(prompt["ask"])
+        if text(prompt.get("say")):
+            d["say"] = text(prompt["say"])
+        field = step.get("field")
+        if isinstance(field, dict) and field.get("key"):
+            d["field"] = {k: field[k] for k in ("key", "type", "label") if k in field}
+            if step.get("kind") == "ask" and (field.get("type") in READBACK_FIELD_TYPES or "readback" in prompt):
+                readback_steps.add(step["id"])
+        if step.get("status"):
+            d["status"] = step["status"]
+        details[step["id"]] = d
+    return {
+        "details": details,
+        "readback_steps": readback_steps,
+        "record_fields": sorted(set(_RECORD_FIELD.findall(raw))),
+        "flow_name": str(doc.get("flow_key") or flow.get("name") or "flow"),
+    }
+
+
+def _interrupt_context(flow_id: int, scenario_id: str) -> tuple[dict, dict, list, dict]:
+    """(flow, graph, interrupts, planned scenario) for an interrupt scenario id,
+    re-planned from the stored source. A saved row must still match the plan."""
+    flow, graph, interrupts = _load_planning_graph(flow_id)
+    if interrupts is None:
+        raise HTTPException(status_code=404, detail=f"scenario '{scenario_id}' not found for flow {flow_id}")
+    item = next((s for s in _interrupt_scenarios(graph, interrupts)[1] if s["id"] == scenario_id), None)
+    if item is None:
+        raise HTTPException(status_code=409, detail=f"interrupt scenario '{scenario_id}' no longer matches flow {flow_id}'s plan")
+    if not item["plannable"]:
+        raise HTTPException(status_code=409, detail=f"interrupt scenario '{item['name']}' cannot be scripted: {item['reason']}")
+    row = get_flow_scenario(flow_id, scenario_id)
+    if row is not None and _json.loads(row["path_json"]) != item["path"]:
+        raise HTTPException(status_code=409, detail=f"interrupt scenario '{scenario_id}' no longer matches flow {flow_id}'s plan")
+    return flow, graph, interrupts, item
+
+
+def _record_values(values: dict | None, allowed: list[str]) -> dict:
+    """Test data the user supplied for the flow's `user.*` record fields, trimmed; blank
+    values dropped. An unknown field is rejected rather than silently kept."""
+    record = {k.strip(): v.strip() for k, v in (values or {}).items() if isinstance(v, str) and v.strip()}
+    unknown = [k for k in record if k not in allowed]
+    if unknown:
+        raise HTTPException(status_code=422, detail={"errors": [
+            f"unknown record field(s): {', '.join(unknown)}; this flow uses: {', '.join(allowed) or 'none'}"
+        ]})
+    return record
+
+
+CALL_PREFIX = "call."
+
+
+def _split_test_data(values: dict | None) -> tuple[dict, dict]:
+    """(record values, call variables): test data named `call.<name>` is for creating
+    the voice agent's call (see app.core.voice_native_ws call variables); everything
+    else is the flow's `user.*` record."""
+    record, call = {}, {}
+    for k, v in (values or {}).items():
+        key = k.strip() if isinstance(k, str) else k
+        if isinstance(key, str) and key.startswith(CALL_PREFIX):
+            call[key[len(CALL_PREFIX):]] = v
+        else:
+            record[k] = v
+    return record, call
+
+
+def _agent_for_flow(flow: dict) -> dict:
+    agent = get_agent(flow["agent_id"])
+    if agent is None:
+        raise HTTPException(status_code=404, detail=f"agent {flow['agent_id']} not found")
+    return dict(agent)
+
+
+def _call_fields(agent: dict) -> list[str]:
+    """The call variables the flow's agent can take from test data (native_ws only)."""
+    return call_template_variables(agent) if (agent.get("voice_protocol") or "") == "native_ws" else []
+
+
+def _call_values(values: dict | None, agent: dict, status_code: int = 422) -> dict:
+    """Call variables for this agent, trimmed; blank values dropped. Any the agent's
+    request_template does not map is rejected — never silently dropped."""
+    call = {k.strip(): v.strip() for k, v in (values or {}).items() if isinstance(v, str) and v.strip()}
+    problems = check_call_variables(agent, call)
+    if problems:
+        raise HTTPException(status_code=status_code, detail={"errors": problems})
+    return call
+
+
+def _interrupt_validation_args(graph: dict, interrupts: list, modular: dict) -> dict:
+    return {
+        "node_kinds": {str(n["id"]): str(n.get("type") or "") for n in graph["nodes"]},
+        "readback_steps": modular["readback_steps"],
+        "interrupts": interrupts,
+    }
+
+
+@router.post("/flows/{flow_id}/scenarios/preview")
+def preview_flow_scenarios(flow_id: int, body: ScenarioPlanRequest | None = None) -> dict:
+    """Plan candidate test scenarios for a stored flow — CALCULATE ONLY.
+
+    Deterministic (same flow -> same response), and side-effect free: no LLM call, no
+    database write, no test case, no run.
+    """
+    body = body or ScenarioPlanRequest()
+    flow, graph, interrupts = _load_planning_graph(flow_id)
+    facts = analyze_graph(graph)
+    scenarios = _plan_scenarios(graph, body.max_scenarios)
+    response = {
+        "flow_id": flow_id,
+        "max_scenarios": body.max_scenarios,
+        "scenario_count": len(scenarios),
+        "graph": {
+            "roots": facts.roots,
+            "roots_inferred": facts.roots_inferred,
+            "entry_points": facts.entry_points,
+            "terminals": facts.terminals,
+            "branch_nodes": facts.branch_nodes,
+            "back_edges": [[u, v] for u, v in facts.back_edges],
+            "unreachable": facts.unreachable,
+        },
+        # id -> name only; the full node objects stay available via GET /flows/{id}.
+        "node_names": {str(n["id"]): str(n.get("name") or n["id"]) for n in graph["nodes"]},
+        "scenarios": scenarios,
+    }
+    # Modular flows only: the interrupt scenarios and the base path they are built on.
+    # Every other flow's response is exactly as before.
+    if interrupts is not None:
+        base_info, interrupt_items = _interrupt_scenarios(graph, interrupts)
+        shown = interrupt_items[:body.max_scenarios]
+        response.update({
+            "base_path": base_info,
+            "interrupt_scenarios": shown,
+            "interrupt_scenario_count": len(shown),
+            "interrupt_scenario_total": len(interrupt_items),
+            # The `user.*` record fields the flow references — test data for scripts.
+            "record_fields": _modular_details(flow)["record_fields"],
+            # Call variables the flow's agent takes from test data, as `call.<name>`.
+            "call_fields": [CALL_PREFIX + n for n in _call_fields(dict(get_agent(flow["agent_id"]) or {}))],
+        })
+    return response
+
+
+@router.post("/flows/{flow_id}/scenarios")
+def save_flow_scenarios(flow_id: int, body: SaveScenariosRequest | None = None) -> dict:
+    """Explicitly save planned scenarios for a flow.
+
+    Scenarios are re-planned server-side from the stored flow rather than accepted from
+    the client, so a saved path can never contain an invented node or edge. Additive
+    and idempotent: already-saved scenarios are left as they are, nothing is deleted or
+    replaced. Not connected to test_cases or execution.
+    """
+    body = body or SaveScenariosRequest()
+    _, graph, interrupts = _load_planning_graph(flow_id)
+
+    if body.scenario_ids is None:
+        chosen = _plan_scenarios(graph, body.max_scenarios)
+    else:
+        # Resolve against the largest plan: every id any preview can show is in it.
+        # Interrupt scenarios are re-planned server-side too — the client only names ids.
+        available = _plan_scenarios(graph, HARD_MAX_SCENARIOS)
+        interrupt_items = _interrupt_scenarios(graph, interrupts)[1] if interrupts is not None else []
+        known = {s["id"] for s in available} | {s["id"] for s in interrupt_items}
+        unknown = [i for i in body.scenario_ids if i not in known]
+        if unknown:
+            raise HTTPException(
+                status_code=422,
+                detail={"errors": [f"unknown scenario id(s) for flow {flow_id}: {', '.join(unknown)}"]},
+            )
+        wanted = set(body.scenario_ids)
+        unplannable = [s for s in interrupt_items if s["id"] in wanted and not s["plannable"]]
+        if unplannable:
+            raise HTTPException(
+                status_code=422,
+                detail={"errors": [f"interrupt scenario '{s['name']}' cannot be saved: {s['reason']}" for s in unplannable]},
+            )
+        chosen = [s for s in available if s["id"] in wanted] + [s for s in interrupt_items if s["id"] in wanted]
+
+    inserted = insert_flow_scenarios(flow_id, chosen)
+    return {
+        "flow_id": flow_id,
+        "inserted": inserted,
+        "scenarios": [_stored_scenario(r) for r in list_flow_scenarios(flow_id)],
+    }
+
+
+@router.get("/flows/{flow_id}/scenarios")
+def get_flow_scenarios(flow_id: int) -> dict:
+    """Every scenario saved for this flow."""
+    if get_agent_flow(flow_id) is None:
+        raise HTTPException(status_code=404, detail=f"flow {flow_id} not found")
+    return {"flow_id": flow_id, "scenarios": [_stored_scenario(r) for r in list_flow_scenarios(flow_id)]}
+
+
+# ---------------------------------------------------------------------------
+# Flow scenario scripts (Phase D): generate / save / delete the conversation script
+# for ONE planned scenario. Drafting and storage only — nothing here creates a test
+# case, starts a run, or places a call.
+# ---------------------------------------------------------------------------
+def _resolve_scenario(flow_id: int, graph: dict, scenario_id: str) -> dict:
+    """The scenario `scenario_id` names, resolved entirely server-side.
+
+    A saved scenario uses its stored path; an unsaved one is looked up in the planner's
+    (deterministic) plan. The client never supplies a path. Either way the path must
+    hash back to `scenario_id` and use only real edges of this flow, so no other path
+    can be substituted for the one the id names.
+    """
+    row = get_flow_scenario(flow_id, scenario_id)
+    if row is not None:
+        if row["category"] == INTERRUPT_CATEGORY:
+            raise HTTPException(status_code=409, detail=INTERRUPT_NO_SCRIPT)
+        scenario = _stored_scenario(row)
+    else:
+        scenario = next(
+            (s for s in _plan_scenarios(graph, HARD_MAX_SCENARIOS) if s["id"] == scenario_id), None
+        )
+    if scenario is None:
+        if _is_planned_interrupt(flow_id, scenario_id):
+            raise HTTPException(status_code=409, detail=INTERRUPT_NO_SCRIPT)
+        raise HTTPException(
+            status_code=404, detail=f"scenario '{scenario_id}' not found for flow {flow_id}"
+        )
+
+    _verify_path(flow_id, graph, scenario_id, scenario["path"])
+    return scenario
+
+
+def _verify_path(flow_id: int, graph: dict, scenario_id: str, path: list[str]) -> None:
+    """409 unless `path` is exactly the path `scenario_id` names and is walkable in this
+    flow: non-empty, every node exists, every consecutive pair is a real edge. Never
+    repairs a path."""
+    edges = {(str(e["from"]), str(e["to"])) for e in graph["edges"]}
+    node_ids = {str(n["id"]) for n in graph["nodes"]}
+    if (
+        _scenario_key(path) != scenario_id
+        or not path
+        or any(n not in node_ids for n in path)
+        or any((a, b) not in edges for a, b in zip(path, path[1:]))
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=f"scenario '{scenario_id}' no longer matches flow {flow_id}'s graph",
+        )
+
+
+class GenerateFlowScript(BaseModel):
+    """Interrupt scenarios only: test data for the flow's `user.*` record fields
+    (e.g. {"user.first_name": "Daniel"}), used verbatim in the script."""
+    test_data: dict[str, str] | None = None
+
+
+def _is_interrupt_request(flow_id: int, scenario_id: str) -> bool:
+    row = get_flow_scenario(flow_id, scenario_id)
+    if row is not None:
+        return row["category"] == INTERRUPT_CATEGORY
+    return _is_planned_interrupt(flow_id, scenario_id)
+
+
+@router.post("/flows/{flow_id}/scenarios/{scenario_id}/script")
+async def generate_flow_scenario_script(
+    flow_id: int, scenario_id: str, body: GenerateFlowScript | None = None
+) -> dict:
+    """Draft a deterministic conversation script for one planned scenario. Calling it
+    again regenerates the script for the SAME path (and, for an interrupt scenario, the
+    same interrupt at the same point). Nothing is saved."""
+    if _is_interrupt_request(flow_id, scenario_id):
+        return await _generate_interrupt_draft(flow_id, scenario_id, (body or GenerateFlowScript()).test_data)
+    _, graph = _load_flow_graph(flow_id)
+    scenario = _resolve_scenario(flow_id, graph, scenario_id)
+    nodes_by_id = {str(n["id"]): n for n in graph["nodes"]}
+    try:
+        generated = await generate_path_script(
+            scenario["path"], nodes_by_id, analyze_graph(graph).out_adj, scenario["category"]
+        )
+    except NodeScriptError as e:
+        raise HTTPException(status_code=422, detail={"errors": e.errors}) from e
+    return {
+        "flow_id": flow_id, "scenario_id": scenario_id,
+        "name": scenario["name"], "category": scenario["category"], "path": scenario["path"],
+        "test_goal": generated["test_goal"], "turns": generated["turns"],
+    }
+
+
+class SaveFlowScenarioScript(BaseModel):
+    test_goal: str
+    turns: list[dict]
+    # Interrupt scripts only; ignored for a path script.
+    setup: dict | None = None
+    expectations: dict | None = None
+
+
+@router.put("/flows/{flow_id}/scenarios/{scenario_id}")
+def save_flow_scenario_script(flow_id: int, scenario_id: str, body: SaveFlowScenarioScript) -> dict:
+    """Save a reviewed/edited script for one scenario (idempotent upsert into
+    flow_scenarios). The script is re-validated against the server-resolved path, so
+    an edit cannot break path correspondence. Creates no test case."""
+    if _is_interrupt_request(flow_id, scenario_id):
+        return _save_interrupt_script(flow_id, scenario_id, body)
+    _, graph = _load_flow_graph(flow_id)
+    scenario = _resolve_scenario(flow_id, graph, scenario_id)
+    try:
+        script = validate_path_script(body.model_dump(), scenario["path"])
+    except NodeScriptError as e:
+        raise HTTPException(status_code=422, detail={"errors": e.errors}) from e
+    row = upsert_flow_scenario_script(flow_id, scenario, script["test_goal"], script["turns"])
+    return _stored_scenario(row)
+
+
+@router.delete("/flows/{flow_id}/scenarios/{scenario_id}")
+def delete_saved_flow_scenario(flow_id: int, scenario_id: str) -> dict:
+    """Delete one saved scenario and its script — nothing else."""
+    if get_agent_flow(flow_id) is None:
+        raise HTTPException(status_code=404, detail=f"flow {flow_id} not found")
+    if not delete_flow_scenario(flow_id, scenario_id):
+        raise HTTPException(
+            status_code=404, detail=f"no saved scenario '{scenario_id}' for flow {flow_id}"
+        )
+    return {"flow_id": flow_id, "scenario_id": scenario_id, "deleted": True}
+
+
+# ---------------------------------------------------------------------------
+# Run a saved flow scenario (Phase E) through the EXISTING pipeline: the same
+# RunGroupWorkflow / AgentTestWorkflow, scripted runner, voice transport and Judge a
+# node test uses. The only flow-specific piece is path_script_to_scenario(), which
+# reshapes the saved script into the scenario dict that pipeline already consumes.
+# Nothing is written to test_cases; the run's own scenarios row is the normal per-run
+# execution copy every run has.
+# ---------------------------------------------------------------------------
+@router.post("/flows/{flow_id}/scenarios/{scenario_id}/run")
+async def run_flow_scenario(flow_id: int, scenario_id: str) -> dict:
+    """Execute one SAVED flow scenario with its SAVED script. Takes no body: the path
+    and script come only from the database, and are re-verified before anything
+    starts — an invalid one is refused without creating a run or placing a call."""
+    flow, graph = _load_flow_graph(flow_id)
+
+    row = get_flow_scenario(flow_id, scenario_id)
+    if row is None:
+        if _is_planned_interrupt(flow_id, scenario_id):
+            raise HTTPException(status_code=409, detail=INTERRUPT_NO_RUN)
+        raise HTTPException(
+            status_code=404,
+            detail=f"no saved scenario '{scenario_id}' for flow {flow_id} — save it before running",
+        )
+    if row["category"] == INTERRUPT_CATEGORY:
+        return await _run_interrupt_scenario(flow_id, scenario_id, row)
+    scenario = _stored_scenario(row)
+    if not scenario["turns"] or not scenario["test_goal"]:
+        raise HTTPException(
+            status_code=409,
+            detail=f"scenario '{scenario_id}' has no saved script — generate and save one before running",
+        )
+
+    _verify_path(flow_id, graph, scenario_id, scenario["path"])
+    try:
+        script = validate_path_script(
+            {"test_goal": scenario["test_goal"], "turns": scenario["turns"]}, scenario["path"]
+        )
+    except NodeScriptError as e:
+        raise HTTPException(status_code=422, detail={"errors": e.errors}) from e
+
+    agent = get_agent(flow["agent_id"])
+    if agent is None:
+        raise HTTPException(status_code=404, detail=f"agent {flow['agent_id']} not found")
+
+    node_names = {str(n["id"]): str(n.get("name") or n["id"]) for n in graph["nodes"]}
+    run_input = path_script_to_scenario(
+        flow_id, scenario_id, scenario["name"], scenario["path"], node_names,
+        script["test_goal"], script["turns"],
+    )
+    # Group the run under the agent's existing customer context if it has one; never
+    # create one just to run a flow scenario (runs.customer_agent_id is nullable).
+    customer_agent = get_customer_agent_by_agent_id(agent["id"])
+    run_id, group_id = await _start_single_scenario_run(
+        agent["id"], customer_agent["id"] if customer_agent else None, run_input
+    )
+    return {"run_id": run_id, "group_id": group_id, "flow_id": flow_id, "scenario_id": scenario_id}
+
+
+# ---------------------------------------------------------------------------
+# Interrupt scenario scripts: generate / save. Everything planner-controlled comes from
+# the server-side re-plan; the model and the client only supply dialogue and
+# expectations, which validate_interrupt_script checks against that plan. A saved
+# interrupt script runs through the same pipeline as a path script
+# (_run_interrupt_scenario).
+# ---------------------------------------------------------------------------
+async def _generate_interrupt_draft(flow_id: int, scenario_id: str, test_data: dict | None) -> dict:
+    flow, graph, interrupts, item = _interrupt_context(flow_id, scenario_id)
+    modular = _modular_details(flow)
+    record_data, call_data = _split_test_data(test_data)
+    record = _record_values(record_data, modular["record_fields"])
+    call = _call_values(call_data, _agent_for_flow(flow)) if call_data else {}
+    try:
+        script = await generate_interrupt_script(
+            item, details=modular["details"], record=record, flow_name=modular["flow_name"],
+            edges=graph["edges"], **_interrupt_validation_args(graph, interrupts, modular),
+        )
+    except NodeScriptError as e:
+        raise HTTPException(status_code=422, detail={"errors": e.errors}) from e
+    if call:
+        script["setup"]["call"] = call
+    return {
+        "flow_id": flow_id, "scenario_id": scenario_id, "name": item["name"],
+        "category": INTERRUPT_CATEGORY, "path": item["path"], **script,
+    }
+
+
+def _save_interrupt_script(flow_id: int, scenario_id: str, body: SaveFlowScenarioScript) -> dict:
+    flow, graph, interrupts, item = _interrupt_context(flow_id, scenario_id)
+    modular = _modular_details(flow)
+    setup = body.setup or {}
+    record = _record_values(setup.get("record"), modular["record_fields"])
+    call = _call_values(setup.get("call"), _agent_for_flow(flow)) if setup.get("call") else {}
+    submitted = {
+        "test_goal": body.test_goal, "turns": body.turns,
+        "assumed_values": setup.get("assumed_values") or {}, "expectations": body.expectations,
+    }
+    try:
+        script = validate_interrupt_script(
+            submitted, item, record=record, **_interrupt_validation_args(graph, interrupts, modular),
+        )
+    except NodeScriptError as e:
+        raise HTTPException(status_code=422, detail={"errors": e.errors}) from e
+    if call:
+        script["setup"]["call"] = call
+    stored = {"turns": script["turns"], "setup": script["setup"], "expectations": script["expectations"]}
+    row = upsert_flow_scenario_script(flow_id, item, script["test_goal"], stored)
+    return _stored_scenario(row)
+
+
+async def _run_interrupt_scenario(flow_id: int, scenario_id: str, row: dict) -> dict:
+    """Execute one SAVED interrupt scenario with its SAVED script, through the same
+    _start_single_scenario_run a path script uses. Before anything starts, the flow is
+    re-planned and the saved script re-validated against that plan; if the flow has
+    changed since it was saved, 409 — an outdated script is never run, regenerated or
+    repaired."""
+    try:
+        flow, graph, interrupts, item = _interrupt_context(flow_id, scenario_id)
+    except HTTPException as e:
+        if e.status_code != 404:
+            raise
+        # The row is saved but the flow no longer plans interrupts at all: stale.
+        raise HTTPException(
+            status_code=409, detail=f"interrupt scenario '{scenario_id}' no longer matches flow {flow_id}'s plan"
+        ) from e
+    saved = _stored_scenario(row)
+    if not saved["turns"] or not saved["test_goal"]:
+        raise HTTPException(status_code=409, detail=INTERRUPT_NO_RUN)
+
+    modular = _modular_details(flow)
+    setup = saved.get("setup") or {}
+    record = setup.get("record") or {}
+    stale = [k for k in record if k not in modular["record_fields"]]
+    submitted = {
+        "test_goal": saved["test_goal"], "turns": saved["turns"],
+        "assumed_values": setup.get("assumed_values") or {}, "expectations": saved.get("expectations"),
+    }
+    try:
+        if stale:
+            raise NodeScriptError([f"record field(s) no longer used by the flow: {', '.join(stale)}"])
+        script = validate_interrupt_script(
+            submitted, item, record=record, **_interrupt_validation_args(graph, interrupts, modular),
+        )
+    except NodeScriptError as e:
+        raise HTTPException(status_code=409, detail={"errors": [
+            f"the saved script for '{item['name']}' no longer matches flow {flow_id}; regenerate and save it before running",
+            *e.errors,
+        ]}) from e
+
+    agent = _agent_for_flow(flow)
+    if setup.get("call"):
+        # The agent's call configuration may have changed since the script was saved.
+        script["setup"]["call"] = _call_values(setup["call"], agent, status_code=409)
+
+    node_names = {str(n["id"]): str(n.get("name") or n["id"]) for n in graph["nodes"]}
+    run_input = interrupt_script_to_scenario(
+        flow_id, scenario_id, item["name"], item, node_names,
+        script["test_goal"], script["turns"], script["setup"], script["expectations"],
+    )
+    customer_agent = get_customer_agent_by_agent_id(agent["id"])
+    run_id, group_id = await _start_single_scenario_run(
+        agent["id"], customer_agent["id"] if customer_agent else None, run_input
+    )
+    return {"run_id": run_id, "group_id": group_id, "flow_id": flow_id, "scenario_id": scenario_id}

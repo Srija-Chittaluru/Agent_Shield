@@ -22,11 +22,16 @@ from typing import Any, Awaitable, Callable, Optional
 from app.core.adapter import send
 from app.core.ai_caller import next_utterance
 from app.core.llm import chat
+from app.core.node_script import NODE_TEST_TYPE, PATH_TEST_TYPE
 from app.core.scenarios import PRESS_TURNS
 from app.db import clear_messages, get_or_create_conversation, insert_message
 
 MAX_TESTER_TURNS = 5
 ADAPTIVE_TYPES = {"injection", "memory", "contradiction"}
+
+# Scripted scenarios authored from an uploaded flow: the Voice Agent opens the call, so
+# its greeting is drained before the first scripted caller line (see _run_scripted).
+AGENT_FIRST_SCRIPTED_TYPES = {NODE_TEST_TYPE, PATH_TEST_TYPE}
 
 # Dynamic-mode-only cap on caller<->agent exchanges, used when a scenario doesn't set
 # its own scenarios.max_turns. Separate from MAX_TESTER_TURNS, which only bounds the
@@ -96,10 +101,32 @@ async def _run_scripted(
     faults: list,
     send_fn: Callable[..., Awaitable[dict]],
     custom_send_fn: bool,
+    greeting_fn: Optional[Callable[[Any, Any], Awaitable[Optional[str]]]] = None,
+    session_ended_fn: Optional[Callable[[Any, Any, Optional[dict]], bool]] = None,
 ) -> None:
     """Play scenario["seed_turns"] in fixed order. Unchanged from before dynamic mode
     existed — every pre-existing scenario (customer_context empty) still runs exactly
-    this path.
+    this path, EXCEPT for two narrowly-scoped additions below, both keyed on test_type:
+
+    - a flow-authored scripted voice test (test_type in AGENT_FIRST_SCRIPTED_TYPES:
+      "flow_node" or "flow_path" — see app.core.node_script) drains the Voice Agent's
+      unprompted opening greeting first, exactly like _run_dynamic already does for the
+      AI Caller;
+    - a flow scenario ("flow_path") plays ALL of its seed_turns rather than stopping at
+      MAX_TESTER_TURNS — but stops as soon as its voice session has ended (the agent
+      hung up, or the call died), asking `session_ended_fn` after each agent turn. The
+      transcript then holds only turns that actually happened: nothing is sent into a
+      dead call, and no string of repeated transport errors is recorded.
+
+    Every other scripted scenario takes both checks to False and runs byte-for-byte as
+    before.
+
+    Why this was needed: a flow-node script's seed_turns are the CALLER's fixed lines
+    (see node_script.to_scenario_dict) recorded as if the caller speaks first. For a
+    voice_protocol with an unprompted agent greeting (native_ws), that's backwards —
+    the real call always opens with the agent speaking, then the caller responding.
+    Without this, the transcript (and the Judge) saw "Caller: ... / Agent: <opening
+    line, mislabelled as the reply>" instead of "Agent: <opening line> / Caller: ...".
     """
     seed_turns = list(scenario.get("seed_turns") or ["Hello, I need help."])
     transcript: list[dict] = []      # {role, content} for the follow-up generator
@@ -108,8 +135,50 @@ async def _run_scripted(
     tester_turns_played = 0
     did_followup = False
 
+    # A flow scenario script is validated against its path server-side and may be
+    # longer than MAX_TESTER_TURNS; every one of its turns must be played, so its cap is
+    # its own length (still finite — the loop never outruns seed_turns, and flow_path
+    # never gets an adaptive follow-up). Every other scenario keeps MAX_TESTER_TURNS.
+    is_flow_path = scenario.get("test_type") == PATH_TEST_TYPE
+    max_tester_turns = len(seed_turns) if is_flow_path else MAX_TESTER_TURNS
+
+    if (
+        custom_send_fn
+        and greeting_fn is not None
+        and scenario.get("test_type") in AGENT_FIRST_SCRIPTED_TYPES
+    ):
+        try:
+            greeting = await greeting_fn(agent, conv_id)
+        except Exception as e:
+            # The transport itself failed while establishing/draining the opening
+            # turn — fail this scenario cleanly here rather than silently proceeding
+            # to send the first scripted caller line into a session that may not
+            # even exist.
+            insert_message(
+                conv_id, turn_index, "agent", _AGENT_ERROR_SENTINEL,
+                {"error": f"failed to receive the agent's opening turn: {e}"},
+            )
+            return
+        if greeting:
+            insert_message(conv_id, turn_index, "agent", greeting, None)
+            transcript.append({"role": "agent", "content": greeting})
+            history_for_agent.append({"role": "assistant", "content": greeting})
+            turn_index += 1
+            # A flow scenario whose agent ended the call in its greeting sends nothing:
+            # the transcript is just the greeting, and teardown/Judge run as usual.
+            if (
+                is_flow_path
+                and session_ended_fn is not None
+                and session_ended_fn(agent, conv_id, None)
+            ):
+                return
+        # greeting falsy (None/""): this protocol has no such opening-greeting concept
+        # (http_json/websocket/twilio), or native_ws's own best-effort capture simply
+        # came back empty — either way, the scenario opens with the caller's first
+        # scripted line exactly as it always has.
+
     i = 0
-    while i < len(seed_turns) and tester_turns_played < MAX_TESTER_TURNS:
+    while i < len(seed_turns) and tester_turns_played < max_tester_turns:
         tester_msg = seed_turns[i]
 
         # --- tester turn ---
@@ -130,7 +199,7 @@ async def _run_scripted(
             and len(seed_turns) < MIN_ADAPTIVE_SEED_TURNS
             and is_last_seed
             and not did_followup
-            and tester_turns_played < MAX_TESTER_TURNS
+            and tester_turns_played < max_tester_turns
         )
         is_last_turn = is_last_seed and not could_extend
 
@@ -146,6 +215,17 @@ async def _run_scripted(
         insert_message(conv_id, turn_index, "agent", reply, trace)
         transcript.append({"role": "agent", "content": reply})
         turn_index += 1
+
+        # A flow scenario stops once the call is over. If the agent ended the call on
+        # this turn, its reply is the last real one. If this turn failed because the
+        # session had died, this one failed attempt (with its error) is kept and nothing
+        # more is sent. Every other scenario continues exactly as before.
+        if (
+            is_flow_path
+            and session_ended_fn is not None
+            and session_ended_fn(agent, conv_id, trace)
+        ):
+            break
 
         # update rolling history for the next agent call
         history_for_agent.append({"role": "user", "content": tester_msg})
@@ -248,6 +328,7 @@ async def run_scenario(
     send_fn: Optional[Callable[..., Awaitable[dict]]] = None,
     close_fn: Optional[Callable[[Any, int], Awaitable[None]]] = None,
     greeting_fn: Optional[Callable[[Any, Any], Awaitable[Optional[str]]]] = None,
+    session_ended_fn: Optional[Callable[[Any, Any, Optional[dict]], bool]] = None,
 ) -> int:
     """Play a scenario end-to-end. Returns the (unjudged) conversation id.
 
@@ -278,16 +359,23 @@ async def run_scenario(
     `is_last_turn` was never true. Defaults to a no-op; chat never supplies one.
 
     `greeting_fn(agent, conv_id)`, if given, is awaited ONCE at the very start of a
-    DYNAMIC scenario only (see below) — for a transport with an unprompted opening
-    greeting (native_ws), it returns that greeting's text so the AI Caller's first line
-    can react to it. Ignored entirely by a scripted scenario, and by any transport that
+    DYNAMIC scenario (see below) — for a transport with an unprompted opening greeting
+    (native_ws), it returns that greeting's text so the AI Caller's first line can
+    react to it. A SCRIPTED scenario also awaits it, but only when
+    scenario["test_type"] is "flow_node" or "flow_path" (see _run_scripted) — every other scripted
+    scenario ignores it exactly as before. Ignored entirely by any transport that
     doesn't supply one.
+
+    `session_ended_fn(agent, conv_id, trace)`, if given, is asked after each agent turn
+    of a flow scenario ("flow_path") only, whether the voice session is over (see
+    app.core.voice_caller.voice_session_ended); True stops the scenario there. Ignored
+    by every other scenario and absent for chat.
 
     Which loop actually plays the scenario depends on `scenario["customer_context"]`
     alone: non-empty -> `_run_dynamic` (the AI Caller, playing the simulated customer,
     converses and reacts turn by turn); empty/absent (every scenario stored before this
     existed) -> `_run_scripted`, the original fixed seed_turns + adaptive-follow-up
-    behaviour, byte-for-byte unchanged.
+    behaviour, unchanged except for the flow-node opening-greeting handling above.
     """
     custom_send_fn = send_fn is not None
     send_fn = send_fn or send
@@ -304,7 +392,10 @@ async def run_scenario(
         if scenario.get("customer_context"):
             await _run_dynamic(conv_id, scenario, agent, faults, send_fn, custom_send_fn, greeting_fn)
         else:
-            await _run_scripted(conv_id, scenario, agent, faults, send_fn, custom_send_fn)
+            await _run_scripted(
+                conv_id, scenario, agent, faults, send_fn, custom_send_fn, greeting_fn,
+                session_ended_fn,
+            )
     finally:
         if close_fn is not None:
             await close_fn(agent, conv_id)

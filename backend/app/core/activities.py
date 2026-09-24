@@ -38,7 +38,12 @@ from app.core.judge import _endpoint_never_responded, judge_conversation
 from app.core.runner import run_scenario
 from app.core.scenarios import generate_scenarios
 from app.core.scoring import compute
-from app.core.voice_caller import call_voice_agent, close_voice_session, peek_opening_greeting
+from app.core.voice_caller import (
+    call_voice_agent,
+    close_voice_session,
+    peek_opening_greeting,
+    voice_session_ended,
+)
 from app.db import (
     get_agent,
     get_conversation,
@@ -147,12 +152,23 @@ async def play_voice_scenario(run_id: int, scenario: dict, agent: dict) -> int:
     entirely unused by a scripted scenario regardless of protocol.
     """
     return await run_scenario(
-        run_id, scenario, agent,
+        run_id, scenario, _with_call_variables(agent, scenario),
         idem_key=f"run:{run_id}:scenario:{scenario['_id']}:voice",
         send_fn=call_voice_agent,
         close_fn=close_voice_session,
         greeting_fn=peek_opening_greeting,
+        # Lets a flow scenario stop once the call is over; ignored by every other kind.
+        session_ended_fn=voice_session_ended,
     )
+
+
+def _with_call_variables(agent: dict, scenario: dict) -> dict:
+    """The agent as its transport should see it for this scenario: with the scenario's
+    call-creation test data (a saved script's setup.call) attached as
+    agent["call_variables"], which app.core.voice_native_ws fills into the call it
+    creates. A scenario without any leaves the agent exactly as loaded."""
+    values = scenario.get("call_variables")
+    return {**agent, "call_variables": values} if values else agent
 
 
 @activity.defn
@@ -172,9 +188,13 @@ async def replay_scenario(run_id: int, scenario: dict, agent: dict) -> int:
     send_fn = call_voice_agent if is_voice else None
     close_fn = close_voice_session if is_voice else None
     greeting_fn = peek_opening_greeting if is_voice else None
+    session_ended_fn = voice_session_ended if is_voice else None
+    if is_voice:
+        agent = _with_call_variables(agent, scenario)
     return await run_scenario(
         run_id, scenario, agent, idem_key=None,
         send_fn=send_fn, close_fn=close_fn, greeting_fn=greeting_fn,
+        session_ended_fn=session_ended_fn,
     )
 
 
@@ -295,6 +315,18 @@ def load_replay_context(conversation_id: int) -> dict | None:
             "assigned_fault": s["assigned_fault"],
             "expected_behavior": s["expected_behavior"],
             "seed_turns": _json.loads(s["seed_turns_json"] or "[]"),
+            **_replay_call_variables(s.get("node_script_json")),
         },
         "agent": dict(agent_row),
     }
+
+
+def _replay_call_variables(node_script_json: str | None) -> dict:
+    """A replayed interrupt scenario creates its call with the same test data: its
+    saved setup.call, kept in the run's own scenarios.node_script_json."""
+    try:
+        script = _json.loads(node_script_json) if node_script_json else None
+    except ValueError:
+        return {}
+    call = ((script or {}).get("setup") or {}).get("call") if isinstance(script, dict) else None
+    return {"call_variables": call} if call else {}

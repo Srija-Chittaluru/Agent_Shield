@@ -456,6 +456,202 @@ export function runNodeTest(
   });
 }
 
+// ---- Flow-level scenario planning: deterministic preview (read-only) ----
+// One candidate path from backend app.core.flow_graph, plus a stable id and a
+// structural display name. `path` holds node ids; look names up in node_names.
+export interface FlowScenario {
+  id: string;
+  name: string;
+  category: string; // happy_path | primary_path | branch | terminal | retry | recovery
+  path: string[];
+  covered_edges: [string, string][];
+  covered_terminals: string[];
+  contains_retry: boolean;
+  branch_node_ids: string[];
+  path_length: number;
+}
+
+export interface FlowScenarioPreview {
+  flow_id: number;
+  max_scenarios: number;
+  scenario_count: number;
+  graph: {
+    roots: string[];
+    roots_inferred: boolean;
+    entry_points: string[];
+    terminals: string[];
+    branch_nodes: string[];
+    back_edges: [string, string][];
+    unreachable: string[];
+  };
+  node_names: Record<string, string>;
+  scenarios: FlowScenario[];
+  // Modular flows only (absent otherwise): interrupt scenarios planned on a base path.
+  base_path?: { scenario_id: string; name: string; path: string[] } | null;
+  interrupt_scenarios?: FlowInterruptScenario[];
+  interrupt_scenario_count?: number;
+  interrupt_scenario_total?: number;
+  record_fields?: string[];
+  // Call variables the flow's voice agent takes from test data, as "call.<name>".
+  call_fields?: string[];
+}
+
+// An interrupt fired at one planned point of the base path. `segments` alternate graph
+// steps and the interrupt event itself — the jump into an interrupt is never an edge.
+export type FlowInterruptSegment =
+  | { kind: "prefix" | "target" | "resumed"; steps: string[]; via?: string }
+  | { kind: "interrupt"; interrupt_id: string; outcome: "goto" | "end" | "resume"; target?: string; end_status?: string };
+
+export interface FlowInterruptScenario {
+  id: string;
+  name: string;
+  category: "interrupt";
+  plannable: boolean;
+  reason?: string;
+  interrupt: {
+    id: string;
+    outcome: "goto" | "end" | "resume";
+    target?: string;
+    end_status?: string;
+    when?: string;
+    priority?: number;
+    critical?: boolean;
+    max_turns?: number;
+  };
+  placement: {
+    policy: "after_greeting" | "after_field_confirmed" | "before_field_confirmed" | null;
+    step?: string;
+    field?: string;
+    field_step?: string;
+    convention: boolean;
+  };
+  segments: FlowInterruptSegment[];
+  path: string[];
+  path_length?: number;
+}
+
+// Calculate-only: no LLM, nothing saved, nothing run. Uses the backend's default
+// max_scenarios.
+export function previewFlowScenarios(flowId: number): Promise<FlowScenarioPreview> {
+  return req(`/flows/${flowId}/scenarios/preview`, { method: "POST" });
+}
+
+// ---- Flow scenario scripts: generate / save / delete (no execution) ----
+// One caller turn, anchored to a position in the scenario's path: at `step` (1-based)
+// the agent acts, then the caller says `caller_line` verbatim.
+// Path scripts have only caller turns (no `type`). Interrupt scripts also use:
+//   listen    — agent-only speech at a say/end step (no caller_line)
+//   readback  — the agent reads a value back; the next turn is the caller confirming
+//   interrupt — the caller raises the planned interrupt (no step/node_id: not a node)
+export interface FlowScriptTurn {
+  type?: "caller" | "listen" | "readback" | "interrupt";
+  step?: number;
+  node_id?: string;
+  interrupt_key?: string;
+  expected_agent_behavior: string;
+  caller_line?: string;
+}
+
+export interface FlowScriptSetup {
+  record: Record<string, string>;
+  assumed_values?: Record<string, string>;
+  // Values the voice agent's call is created with (its request_template variables).
+  call?: Record<string, string>;
+}
+
+export interface FlowScriptExpectations {
+  outcome: string;
+  bug_guards: string[];
+  end_status?: string;
+}
+
+export interface GeneratedFlowScript {
+  flow_id: number;
+  scenario_id: string;
+  name: string;
+  category: string;
+  path: string[];
+  test_goal: string;
+  turns: FlowScriptTurn[];
+  setup?: FlowScriptSetup;
+  expectations?: FlowScriptExpectations;
+}
+
+export interface SavedFlowScenario {
+  id: string;
+  scenario_row_id: number;
+  category: string;
+  name: string;
+  test_goal: string | null;
+  path: string[];
+  covered_edges: [string, string][];
+  covered_terminals: string[];
+  contains_retry: boolean;
+  path_length: number;
+  created_at: string;
+  turns: FlowScriptTurn[] | null;
+  setup?: FlowScriptSetup | null;
+  expectations?: FlowScriptExpectations | null;
+}
+
+// Draft (or redraft) the script for one planned scenario. The server resolves the
+// path from the scenario id; nothing is saved.
+// `testData` (interrupt scenarios only): values for the flow's user.* record fields.
+export function generateFlowScenarioScript(
+  flowId: number,
+  scenarioId: string,
+  testData?: Record<string, string>
+): Promise<GeneratedFlowScript> {
+  return req(`/flows/${flowId}/scenarios/${encodeURIComponent(scenarioId)}/script`, {
+    method: "POST",
+    ...(testData ? { body: JSON.stringify({ test_data: testData }) } : {}),
+  });
+}
+
+// Idempotent upsert of the reviewed script into flow_scenarios. Creates no test case.
+export function saveFlowScenarioScript(
+  flowId: number,
+  scenarioId: string,
+  testGoal: string,
+  turns: FlowScriptTurn[],
+  extras?: { setup?: FlowScriptSetup; expectations?: FlowScriptExpectations }
+): Promise<SavedFlowScenario> {
+  return req(`/flows/${flowId}/scenarios/${encodeURIComponent(scenarioId)}`, {
+    method: "PUT",
+    body: JSON.stringify({ test_goal: testGoal, turns, ...(extras ?? {}) }),
+  });
+}
+
+export function deleteFlowScenario(flowId: number, scenarioId: string): Promise<{ deleted: boolean }> {
+  return req(`/flows/${flowId}/scenarios/${encodeURIComponent(scenarioId)}`, { method: "DELETE" });
+}
+
+// Run a SAVED flow scenario's SAVED script through the existing Temporal/voice
+// pipeline. No body: the server loads and re-validates the path and script itself.
+// Poll the returned run with getRun/getReport, like any other run.
+export function runFlowScenario(
+  flowId: number,
+  scenarioId: string
+): Promise<{ run_id: number; group_id: number; flow_id: number; scenario_id: string }> {
+  return req(`/flows/${flowId}/scenarios/${encodeURIComponent(scenarioId)}/run`, { method: "POST" });
+}
+
+// Save planned scenarios by id (normal or interrupt). The server re-plans and stores
+// only what it planned itself; saving an already-saved id is a no-op.
+export function saveFlowScenariosById(
+  flowId: number,
+  scenarioIds: string[]
+): Promise<{ flow_id: number; inserted: number; scenarios: SavedFlowScenario[] }> {
+  return req(`/flows/${flowId}/scenarios`, {
+    method: "POST",
+    body: JSON.stringify({ scenario_ids: scenarioIds }),
+  });
+}
+
+export function listSavedFlowScenarios(flowId: number): Promise<{ flow_id: number; scenarios: SavedFlowScenario[] }> {
+  return req(`/flows/${flowId}/scenarios`);
+}
+
 export function generateOneScenario(
   agentId: number,
   description: string,

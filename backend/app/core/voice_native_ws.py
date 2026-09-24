@@ -30,8 +30,15 @@ app/api/routes/simulator.py and app/transports/orchestrator_processor.py:
             {"type": "simulated_utterance", "text": "..."}
     POST {base}/api/calls/{call_id}/end   -> best-effort finalize
 
-The instant the socket opens, the agent speaks first, unprompted — one "agent" turn
-event arrives before we ever send anything. run_scenario()'s turn loop is
+The instant the socket opens, the agent speaks first, unprompted — at least one "agent"
+turn event arrives before we ever send anything.
+
+One reply may be SEVERAL consecutive agent turns: a target that has more to say without
+asking anything (a greeting, then its first question) speaks each as its own turn, and
+a caller line sent between two of them is dropped by the target (its current turn owns
+the moment). So every read — the opening and each reply — takes the agent's whole
+output (_read_agent_output): consecutive agent turns until the agent has finished
+speaking and nothing more follows, joined into one reply. run_scenario()'s turn loop is
 tester-first (seed turn -> reply), so that greeting has no transcript slot of its
 own; it is captured as trace["opening_line"] on the FIRST turn rather than dropped
 or misread as the reply to that turn's tester message.
@@ -51,7 +58,8 @@ system already knows how to score as a system failure — no Judge change needed
 """
 import asyncio
 import json
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, field
 from typing import Any, Optional
 
 import httpx
@@ -62,6 +70,21 @@ from app.core.adapter import DEFAULT_TIMEOUT_S
 # Matches app.core.judge.AGENT_ERROR_SENTINEL / app.core.voice_caller.AGENT_ERROR_SENTINEL
 # exactly — kept as a literal, same tradeoff already made in twilio_bridge.py.
 AGENT_ERROR_SENTINEL = "<error>"
+
+# When one exchange's agent output counts as finished, so the caller may speak (see
+# _read_agent_output). The agent composes a consecutive turn while its previous line is
+# still being heard, so the wait is measured both from its last turn and from its last
+# audio:
+#   SETTLE_S       — no new agent turn for this long (covers composing the next turn
+#                    after a short line; the target's model latency varies, ~1-3 s)
+#   AUDIO_QUIET_S  — and no audio frame for this long (the target streams its speech in
+#                    real time, so audio still arriving means it is still talking)
+#   SPEAKING_MAX_S — while the target itself reports speaking, at most this long
+#   MAX_OUTPUT_S   — never wait longer than this after the first turn, whatever arrives
+SETTLE_S = 4.0
+AUDIO_QUIET_S = 1.0
+SPEAKING_MAX_S = DEFAULT_TIMEOUT_S
+MAX_OUTPUT_S = 120.0
 
 
 @dataclass
@@ -76,6 +99,14 @@ class _Session:
     ws: Any = None
     closed: bool = False
     opening_line: Optional[str] = None
+    # The greeting turn's end_status, if the agent ended the call in its very first
+    # turn. Only read by session_ended(); nothing else changes because of it.
+    opening_end_status: Optional[str] = None
+    # Frames read while collecting one reply that belong to the next exchange (a
+    # caller echo); consumed first by the next read.
+    pending: list = field(default_factory=list)
+    # Why setting the call up failed, when it did — reported by every later turn.
+    setup_error: Optional[str] = None
 
 
 _SESSIONS: dict[Any, _Session] = {}
@@ -100,21 +131,81 @@ def _auth_headers(agent: Any) -> dict[str, str]:
     return headers
 
 
-def _create_call_body(agent: Any) -> dict:
-    """`request_template`, parsed as the JSON body for POST /api/calls.
+# A request_template value that is exactly "{{name}}" is a call variable: filled from
+# the scenario's test data (agent["call_variables"]) when it supplies `name`, and left
+# out of the body when it does not — so the body is then exactly the template without
+# that field.
+_CALL_VARIABLE = re.compile(r"^\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}$")
 
-    Falls back to `{}` on anything unparsable, so a misconfigured agent fails as a
-    clean HTTP 4xx from the target (caught by _open_session) rather than crashing
-    this module.
-    """
+
+class CallVariableError(ValueError):
+    """Test data names a call variable the agent's request_template does not map."""
+
+
+def _parsed_template(agent: Any) -> Optional[dict]:
     raw = agent.get("request_template")
     if not raw:
         return {}
     try:
         body = json.loads(raw)
     except (json.JSONDecodeError, ValueError):
+        return None
+    return body if isinstance(body, dict) else None
+
+
+def call_template_variables(agent: Any) -> list[str]:
+    """The call variables this agent's request_template declares, in template order."""
+    body = _parsed_template(agent) or {}
+    names = []
+    for value in body.values():
+        m = _CALL_VARIABLE.match(value) if isinstance(value, str) else None
+        if m and m.group(1) not in names:
+            names.append(m.group(1))
+    return names
+
+
+def check_call_variables(agent: Any, values: Optional[dict]) -> list[str]:
+    """Problems with supplying `values` to this agent's call creation (empty if none)."""
+    if not values:
+        return []
+    if (agent.get("voice_protocol") or "") != "native_ws":
+        return [f"call variables are only supported for native_ws voice agents; this agent uses {agent.get('voice_protocol')!r}"]
+    if _parsed_template(agent) is None:
+        return ["the agent's request_template is not a JSON object, so it cannot take call variables"]
+    declared = call_template_variables(agent)
+    unknown = [k for k in values if k not in declared]
+    if unknown:
+        return [
+            f"call variable(s) {', '.join(unknown)} are not mapped by the agent's request_template "
+            f"(it declares: {', '.join(declared) or 'none'}); add e.g. \"{unknown[0]}\": \"{{{{{unknown[0]}}}}}\""
+        ]
+    return [f"call variable {k!r} must be a non-empty string" for k, v in values.items() if not isinstance(v, str) or not v.strip()]
+
+
+def _create_call_body(agent: Any) -> dict:
+    """`request_template`, parsed as the JSON body for POST /api/calls, with its call
+    variables filled from agent["call_variables"] (see _CALL_VARIABLE).
+
+    Without call variables supplied, falls back to `{}` on anything unparsable, so a
+    misconfigured agent fails as a clean HTTP 4xx from the target (caught by
+    _open_session) rather than crashing this module — unchanged. Supplied call variables
+    the template cannot take raise CallVariableError instead of being dropped.
+    """
+    values = agent.get("call_variables") or {}
+    problems = check_call_variables(agent, values)
+    if problems:
+        raise CallVariableError("; ".join(problems))
+    body = _parsed_template(agent)
+    if body is None:
         return {}
-    return body if isinstance(body, dict) else {}
+    filled = {}
+    for key, value in body.items():
+        m = _CALL_VARIABLE.match(value) if isinstance(value, str) else None
+        if m is None:
+            filled[key] = value
+        elif m.group(1) in values:
+            filled[key] = values[m.group(1)].strip()
+    return filled
 
 
 async def _next_agent_turn(ws: Any) -> Optional[dict]:
@@ -141,6 +232,100 @@ async def _next_agent_turn(ws: Any) -> Optional[dict]:
             continue
         if payload.get("type") == "turn" and payload.get("role") == "agent":
             return payload
+
+
+async def _read_agent_output(session: _Session, first_timeout: float = DEFAULT_TIMEOUT_S) -> list[dict]:
+    """The agent's whole output for one exchange: every consecutive agent "turn" event
+    until the agent has finished.
+
+    Waits up to `first_timeout` for the first agent turn (raising, as _next_agent_turn
+    does, if none arrives or the socket fails first). After that the output is finished
+    when any of these happens:
+      - a turn carries `end_status` (the call is ending — returned at once);
+      - the agent has gone quiet: no new agent turn for SETTLE_S AND no audio frame
+        for AUDIO_QUIET_S (while the target reports `{"type": "speaking", "speaking":
+        true}`, up to SPEAKING_MAX_S instead). A target that streams no audio and sends
+        no speaking events settles SETTLE_S after its last turn;
+      - a caller "turn" echo arrives (the next exchange has begun; kept for the next read);
+      - the socket fails or closes (what was collected is returned; the next send then
+        fails and tombstones the session exactly as before);
+      - MAX_OUTPUT_S has passed since the first turn.
+    """
+    loop = asyncio.get_running_loop()
+    turns: list[dict] = []
+    speaking = False
+    last_turn = last_audio = last_speaking = cap = 0.0
+
+    def settle_deadline() -> float:
+        if speaking:
+            return min(cap, last_speaking + SPEAKING_MAX_S)
+        return min(cap, max(last_turn + SETTLE_S, last_audio + AUDIO_QUIET_S))
+
+    first_deadline = loop.time() + first_timeout
+    while True:
+        if session.pending:
+            raw = session.pending.pop(0)
+        else:
+            remaining = (settle_deadline() if turns else first_deadline) - loop.time()
+            if remaining <= 0:
+                if turns:
+                    return turns
+                raise asyncio.TimeoutError("no agent turn")
+            try:
+                raw = await asyncio.wait_for(session.ws.recv(), timeout=remaining)
+            except Exception:
+                if turns:
+                    return turns
+                raise
+        now = loop.time()
+        if not isinstance(raw, str):
+            last_audio = now  # the target's speech audio: it is still talking
+            continue
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        kind = payload.get("type")
+        if kind == "speaking":
+            speaking = bool(payload.get("speaking"))
+            last_speaking = now
+            continue
+        if kind != "turn":
+            continue
+        if payload.get("role") == "caller":
+            if turns:
+                session.pending.insert(0, raw)
+                return turns
+            continue  # the echo of the line just sent
+        if payload.get("role") != "agent":
+            continue
+        if not turns:
+            cap = now + MAX_OUTPUT_S
+        turns.append(payload)
+        last_turn = now
+        if payload.get("end_status"):
+            return turns
+
+
+def _combine_turns(turns: list[dict]) -> tuple[str, dict]:
+    """(reply text, trace fields) for consecutive agent turns. The reply is their texts
+    joined in order. Trace: `end_status` and `answers` as the latest turn reporting them
+    (answers is the target's running total), `interrupt_key` as the first turn reporting
+    one, and — only when there was more than one turn — each turn's text as `agent_turns`."""
+    reply = " ".join(str(t.get("text") or "").strip() for t in turns if str(t.get("text") or "").strip())
+    info: dict = {}
+    for t in turns:
+        if t.get("end_status"):
+            info["end_status"] = t["end_status"]
+        if t.get("answers"):
+            info["answers"] = t["answers"]
+        if t.get("interrupt_key") and "interrupt_key" not in info:
+            info["interrupt_key"] = t["interrupt_key"]
+    if len(turns) > 1:
+        info["agent_turns"] = [str(t.get("text") or "") for t in turns]
+    return reply, info
 
 
 async def _open_session(agent: Any, session: _Session) -> None:
@@ -174,8 +359,11 @@ async def _open_session(agent: Any, session: _Session) -> None:
     session.ws = await websockets.connect(_ws_url(base_url, session.call_id))
 
     try:
-        greeting = await asyncio.wait_for(_next_agent_turn(session.ws), timeout=DEFAULT_TIMEOUT_S)
-        session.opening_line = greeting.get("text") if greeting else None
+        # The whole opening — a greeting may be followed straight away by the agent's
+        # first question, and the caller must not speak between them.
+        greeting, info = _combine_turns(await _read_agent_output(session))
+        session.opening_line = greeting or None
+        session.opening_end_status = info.get("end_status") or None
     except Exception:
         session.opening_line = None
 
@@ -206,7 +394,8 @@ async def _call_via_native_ws(
         return {
             "reply": AGENT_ERROR_SENTINEL,
             "trace": {
-                "error": "native_ws session for this conversation already ended (a prior turn failed)"
+                "error": f"native_ws call setup error: {session.setup_error}" if session.setup_error
+                else "native_ws session for this conversation already ended (a prior turn failed)"
             },
         }
 
@@ -228,21 +417,17 @@ async def _call_via_native_ws(
 
     try:
         await session.ws.send(json.dumps({"type": "simulated_utterance", "text": message}))
-        turn = await asyncio.wait_for(_next_agent_turn(session.ws), timeout=DEFAULT_TIMEOUT_S)
+        turns = await _read_agent_output(session)
     except Exception as e:
         session.closed = True  # tombstone — a later turn must fail fast, not reconnect silently
         return {"reply": AGENT_ERROR_SENTINEL, "trace": {**trace, "error": f"native_ws turn error: {e}"}}
 
-    if not turn:
+    if not turns:
         session.closed = True
         return {"reply": AGENT_ERROR_SENTINEL, "trace": {**trace, "error": "socket closed with no agent reply"}}
 
-    reply = str(turn.get("text") or "")
-    if turn.get("end_status"):
-        trace["end_status"] = turn["end_status"]
-    if turn.get("answers"):
-        trace["answers"] = turn["answers"]
-
+    reply, info = _combine_turns(turns)
+    trace.update(info)
     return {"reply": reply, "trace": trace}
 
 
@@ -276,8 +461,9 @@ async def peek_greeting(agent: Any, session_key: Any) -> Optional[str]:
             _SESSIONS[session_key] = session
         try:
             await _open_session(agent, session)
-        except Exception:
+        except Exception as e:
             session.closed = True
+            session.setup_error = str(e)
             return None
 
     greeting = session.opening_line
@@ -306,3 +492,16 @@ async def close_native_ws_session(session_key: Any) -> None:
                 await client.post(f"{session.base_url}/api/calls/{session.call_id}/end")
         except Exception:
             pass
+
+
+def session_ended(session_key: Any, trace: Optional[dict] = None) -> bool:
+    """Read-only: has this conversation's call ended? True when the agent's latest turn
+    carried the target's `end_status` (its final call disposition — it is only ever
+    sent on the call's last agent turn), when the opening greeting itself carried one
+    (the agent ended the call in its first turn), or when a failed turn already
+    tombstoned the session. Changes no session state; used by the runner to stop
+    sending caller lines into a call that is over."""
+    if trace and trace.get("end_status"):
+        return True
+    session = _SESSIONS.get(session_key)
+    return session is not None and (session.closed or bool(session.opening_end_status))

@@ -138,6 +138,30 @@ async def peek_opening_greeting(agent: Any, session_key: Any) -> Optional[str]:
     return None
 
 
+def voice_session_ended(agent: Any, session_key: Any, trace: Optional[dict] = None) -> bool:
+    """Read-only: has this conversation's voice session ended, so no further turn can be
+    heard? `trace` is the latest turn's trace. Dispatches on voice_protocol like the
+    functions around it:
+
+      native_ws -> the agent's turn carried end_status, or the session was tombstoned
+      twilio    -> the call/stream session was tombstoned
+      http_json / websocket -> always False: they hold no session across turns, so one
+                   failed turn never means the next can't be delivered.
+
+    Asks only; never changes session state.
+    """
+    protocol = agent.get("voice_protocol") or "http_json"
+    if protocol == "native_ws":
+        from app.core.voice_native_ws import session_ended
+
+        return session_ended(session_key, trace)
+    if protocol == "twilio":
+        from app.core.twilio_bridge import session_ended
+
+        return session_ended(session_key)
+    return False
+
+
 async def close_voice_session(agent: Any, session_key: Any) -> None:
     """Called exactly once from run_scenario()'s finally, for every voice-modality
     scenario regardless of how it ended — see run_scenario()'s `close_fn` parameter.

@@ -291,6 +291,279 @@ def normalize_explicit_edges(raw_edges: list, seen_ids: set[str]) -> tuple[list[
     return edges, errors
 
 
+# ---------------------------------------------------------------------------
+# Format adapter: modular step flows (e.g. maya_renewal_modular.yaml).
+#
+#   entry: greet
+#   defaults: {answer: {on_decline: advance, on_exhaust: advance, ...}}
+#   steps:
+#     - {id: ask_x, kind: ask, next: route_x, answer: {on_decline: "goto:say_y"}}
+#     - {id: route_x, kind: branch, cases: [{when: ..., label: ..., goto: z}], default: w}
+#
+# In this format transitions are declared in several places, not just `next`; the
+# generic scanner above only reads `next`. This adapter reads every DECLARED form and
+# nothing else:
+#
+#   next: <step>                     -> type "next"
+#   cases[].goto: <step>             -> type "case" (label + when kept as metadata)
+#   default: <step>                  -> type "default"
+#   answer.on_*: "goto:<step>"       -> type "answer" (label = the on_* event); for an
+#                                       `ask` step, events it doesn't set come from the
+#                                       explicit flow-level `defaults.answer` block
+#
+# A target may be `advance`, which this format defines as "the next step in the
+# declared list order" — resolved against the parsed step list. A target of `resume`
+# depends on call history (return to wherever the call was interrupted), so it never
+# becomes an edge: it is kept on the node as `control_transitions`.
+#
+# Deliberately NOT read: step adjacency where no transition is declared (no implicit
+# fall-through), `transfer` blocks, and anything inferred from `when` text, names or
+# descriptions. The flow-level `interrupts:` list is normalized separately — never
+# as edges — by modular_interrupts() below.
+# ---------------------------------------------------------------------------
+ADVANCE = "advance"
+RESUME = "resume"
+
+
+def is_modular_step_flow(raw: object) -> bool:
+    """A top-level `entry` plus a non-empty `steps` list whose every item has an `id`
+    and a `kind` — the shape of this format. Anything else keeps the generic path."""
+    if not isinstance(raw, dict) or not isinstance(raw.get("entry"), str):
+        return False
+    steps = raw.get("steps")
+    return (
+        isinstance(steps, list) and bool(steps)
+        and all(isinstance(s, dict) and s.get("id") and s.get("kind") for s in steps)
+    )
+
+
+def _goto_value(value: object) -> Optional[str]:
+    """The target named by a transition value: "goto:X" or {"goto": X} -> X; a bare
+    string (as `next`/`default`/`cases[].goto` use) -> itself. None if not a goto."""
+    if isinstance(value, dict):
+        value = value.get("goto")
+    if not isinstance(value, str) or not value.strip():
+        return None
+    value = value.strip()
+    return value[len("goto:"):].strip() if value.startswith("goto:") else value
+
+
+def modular_step_transitions(
+    raw: dict, nodes: list[dict]
+) -> tuple[list[dict], dict[str, list[dict]], list[str]]:
+    """(edges, control_transitions by node id, errors) for a modular step flow.
+
+    `nodes` are the already-normalized steps, in file order. A declared target that
+    names no step is an error (these are declared transitions, same strictness as a
+    top-level edges list) — except under `next`, which keeps the generic parser's
+    lenient inline-hint behaviour of dropping an unresolvable reference.
+    """
+    steps = raw["steps"]
+    if len(steps) != len(nodes):
+        return [], {}, []
+    position = {n["id"]: i for i, n in enumerate(nodes)}
+    defaults_answer = (raw.get("defaults") or {}).get("answer") or {}
+    if not isinstance(defaults_answer, dict):
+        defaults_answer = {}
+
+    edges: list[dict] = []
+    seen: set[tuple] = set()
+    controls: dict[str, list[dict]] = {}
+    errors: list[str] = []
+
+    def emit(step_id: str, value: object, meta: dict, where: str, *, lenient: bool = False,
+             declared_on_step: bool = True) -> None:
+        target = _goto_value(value)
+        if target is None:
+            if not lenient:
+                errors.append(f"step '{step_id}': {where} must name a step, got {value!r}.")
+            return
+        edge_meta = dict(meta)
+        if target == RESUME:
+            controls.setdefault(step_id, []).append({**edge_meta, "target": RESUME})
+            return
+        if target == ADVANCE:
+            index = position[step_id] + 1
+            if index >= len(nodes):
+                # Only a transition declared on the step itself is malformed here; an
+                # inherited default simply has nowhere to advance to.
+                if declared_on_step:
+                    errors.append(
+                        f"step '{step_id}': {where} is 'advance', but it is the last step — "
+                        "there is no next step to advance to."
+                    )
+                return
+            target = nodes[index]["id"]
+            edge_meta["advance"] = True
+        elif target not in position:
+            if not lenient:
+                errors.append(f"step '{step_id}': {where} points to unknown step '{target}'.")
+            return
+        edge = {"from": step_id, "to": target, **edge_meta}
+        key = tuple(sorted(edge.items()))
+        if key not in seen:
+            seen.add(key)
+            edges.append(edge)
+
+    for step, node in zip(steps, nodes):
+        step_id = node["id"]
+
+        if "next" in step:
+            emit(step_id, step["next"], {"type": "next"}, "next", lenient=True)
+
+        cases = step.get("cases")
+        if cases is not None:
+            if not isinstance(cases, list):
+                errors.append(f"step '{step_id}': cases must be a list.")
+                cases = []
+            for i, case in enumerate(cases):
+                if not isinstance(case, dict) or "goto" not in case:
+                    errors.append(f"step '{step_id}': cases[{i}] must be an object with a 'goto'.")
+                    continue
+                meta = {"type": "case"}
+                if case.get("label") not in (None, ""):
+                    meta["label"] = str(case["label"])
+                if case.get("when") not in (None, ""):
+                    meta["when"] = str(case["when"])
+                emit(step_id, case["goto"], meta, f"cases[{i}].goto")
+
+        if "default" in step:
+            emit(step_id, step["default"], {"type": "default", "label": "default"}, "default")
+
+        answer = step.get("answer")
+        if answer is not None and not isinstance(answer, dict):
+            errors.append(f"step '{step_id}': answer must be an object.")
+            answer = {}
+        own = {k: v for k, v in (answer or {}).items() if str(k).startswith("on_")}
+        inherited = (
+            {k: v for k, v in defaults_answer.items() if str(k).startswith("on_") and k not in own}
+            if step.get("kind") == "ask" else {}
+        )
+        for events, from_defaults in ((own, False), (inherited, True)):
+            for event, value in events.items():
+                # Only transition-shaped values ("advance", "goto:X", {"goto": X},
+                # "resume") are transitions; any other answer setting is not.
+                target = _goto_value(value)
+                if target is None or (
+                    target not in (ADVANCE, RESUME)
+                    and not (isinstance(value, dict) or str(value).strip().startswith("goto:"))
+                ):
+                    continue
+                meta = {"type": "answer", "label": str(event)}
+                if from_defaults:
+                    meta["from_defaults"] = True
+                where = f"defaults.answer.{event}" if from_defaults else f"answer.{event}"
+                emit(step_id, value, meta, where, declared_on_step=not from_defaults)
+
+    return edges, controls, errors
+
+
+END = "end"
+
+
+def modular_interrupts(raw: dict, step_ids: set[str]) -> tuple[list[dict], list[str]]:
+    """(interrupts, errors) for a modular step flow's top-level `interrupts:` list.
+
+    Interrupts are events the caller can raise at any point in the call — the file
+    never ties them to particular steps — so they are NOT edges. Each is normalized to:
+
+        {"id": <key>, "priority": int, "detection": {lang: {"keywords": [...],
+         "negative": [...]}}, "outcome": "goto" | "end" | "resume",
+         "target": <step id>   (outcome "goto" only),
+         "when": str, "end_status": str, "critical": bool, "max_turns": int  (when declared)}
+
+    `outcome`/`target` come from the entry's `resume` field: "goto:<step>" hands the
+    call to that step, "end" ends it (with `end_status`), "resume" returns to wherever
+    the call was interrupted — which depends on call history, so no target is guessed.
+    `when` is kept verbatim, never evaluated. The agent's `prompt` wording is left in
+    the raw source. Nothing about where an interrupt can fire is inferred.
+    """
+    entries = raw.get("interrupts")
+    if not isinstance(entries, list):
+        return [], ["interrupts must be a list."]
+
+    interrupts: list[dict] = []
+    errors: list[str] = []
+    seen: set[str] = set()
+    for i, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            errors.append(f"interrupts[{i}] must be an object.")
+            continue
+        key = entry.get("key")
+        if not isinstance(key, str) or not key.strip():
+            errors.append(f"interrupts[{i}] must have a 'key'.")
+            continue
+        key = key.strip()
+        if key in seen:
+            errors.append(f"Duplicate interrupt key: '{key}'.")
+            continue
+        seen.add(key)
+
+        item: dict = {"id": key}
+        if "priority" in entry:
+            if isinstance(entry["priority"], bool) or not isinstance(entry["priority"], int):
+                errors.append(f"interrupt '{key}': priority must be an integer.")
+                continue
+            item["priority"] = entry["priority"]
+
+        detection = entry.get("detection")
+        if detection is not None:
+            normalized_detection = {}
+            if not isinstance(detection, dict):
+                errors.append(f"interrupt '{key}': detection must be an object keyed by language.")
+                continue
+            bad = False
+            for lang, spec in detection.items():
+                if not isinstance(spec, dict):
+                    errors.append(f"interrupt '{key}': detection.{lang} must be an object.")
+                    bad = True
+                    continue
+                phrases = {}
+                for field in ("keywords", "negative"):
+                    if field not in spec:
+                        continue
+                    values = spec[field]
+                    if not isinstance(values, list) or not all(isinstance(v, str) for v in values):
+                        errors.append(f"interrupt '{key}': detection.{lang}.{field} must be a list of strings.")
+                        bad = True
+                        continue
+                    phrases[field] = list(values)
+                normalized_detection[str(lang)] = phrases
+            if bad:
+                continue
+            item["detection"] = normalized_detection
+
+        resume = entry.get("resume")
+        target = _goto_value(resume) if isinstance(resume, str) and resume.strip().startswith("goto:") else None
+        if resume == END:
+            item["outcome"] = END
+        elif resume == RESUME:
+            item["outcome"] = RESUME
+        elif target:
+            if target not in step_ids:
+                errors.append(f"interrupt '{key}': resume points to unknown step '{target}'.")
+                continue
+            item["outcome"] = "goto"
+            item["target"] = target
+        else:
+            errors.append(
+                f"interrupt '{key}': resume must be 'end', 'resume' or 'goto:<step>', got {resume!r}."
+            )
+            continue
+
+        if entry.get("when") not in (None, ""):
+            item["when"] = str(entry["when"])
+        if entry.get("end_status") not in (None, ""):
+            item["end_status"] = str(entry["end_status"])
+        if "critical" in entry:
+            item["critical"] = bool(entry["critical"])
+        if "max_turns" in entry:
+            item["max_turns"] = entry["max_turns"]
+        interrupts.append(item)
+
+    return interrupts, errors
+
+
 def _diagnostics(raw: dict) -> dict:
     """What Part-7-style failures show the user instead of a bare "define nodes"
     message: a summary of what IS in the file, so they can see why nothing matched.
@@ -369,19 +642,45 @@ def parse_flow(source_text: str, source_format: Optional[str] = None) -> dict:
     explicit_edges, edge_errors = normalize_explicit_edges(raw_edges, seen_ids)
     errors.extend(edge_errors)
 
-    # ... plus lenient inline per-node hints (next/goto/...), never inferred from
-    # ordering — see _extract_inline_edges's docstring.
-    inline_edges = _extract_inline_edges(raw_node_items, nodes)
+    # ... plus per-node transitions: for a modular step flow, every form that format
+    # declares (see modular_step_transitions); otherwise the lenient inline hints
+    # (next/goto/...), never inferred from ordering — see _extract_inline_edges.
+    interrupts = None
+    if explicit_nodes is None and is_modular_step_flow(raw) and raw_node_items is raw["steps"]:
+        inline_edges, controls, transition_errors = modular_step_transitions(raw, nodes)
+        errors.extend(transition_errors)
+        for node in nodes:
+            if node["id"] in controls:
+                node["control_transitions"] = controls[node["id"]]
+        # The answer field a step collects (`field.key`, `field.save_to`), kept so a
+        # condition such as `status.dob == 'confirmed'` can be tied to the step that
+        # collects `dob` without guessing from names. Data only; nothing reads it here.
+        for step, node in zip(raw["steps"], nodes):
+            field = step.get("field")
+            if isinstance(field, dict) and isinstance(field.get("key"), str) and field["key"].strip():
+                node["field"] = {"key": field["key"].strip()}
+                if isinstance(field.get("save_to"), str):
+                    node["field"]["save_to"] = field["save_to"]
+        if "interrupts" in raw:
+            interrupts, interrupt_errors = modular_interrupts(raw, seen_ids)
+            errors.extend(interrupt_errors)
+    else:
+        inline_edges = _extract_inline_edges(raw_node_items, nodes)
     seen_pairs = {(e["from"], e["to"]) for e in explicit_edges}
     edges = explicit_edges + [e for e in inline_edges if (e["from"], e["to"]) not in seen_pairs]
 
     if errors:
         raise FlowParseError(errors)
 
-    return {
+    result = {
         "agent_name": str(agent_name),
         "nodes": nodes,
         "edges": edges,
         "source_format": detected_format,
         "extraction_method": "deterministic",
     }
+    # Only a modular step flow that declares `interrupts:` gets this key; every other
+    # flow's result is exactly as before.
+    if interrupts is not None:
+        result["interrupts"] = interrupts
+    return result

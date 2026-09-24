@@ -29,6 +29,8 @@ VALID_TYPES = {
     # feature reuses) doesn't silently downgrade it back to "support" — it must reach
     # app.core.runner as "flow_node" so it never enters ADAPTIVE_TYPES there.
     "flow_node",
+    # Flow scenario (path) test, app.core.node_script.PATH_TEST_TYPE — same reason.
+    "flow_path",
 }
 VALID_FAULTS = {
     "none", "tool_timeout", "stale_doc", "injection",

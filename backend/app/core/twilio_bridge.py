@@ -558,3 +558,10 @@ def _b64(data: bytes) -> str:
 
 def _b64decode(data: str) -> bytes:
     return base64.b64decode(data)
+
+
+def session_ended(session_key: Any) -> bool:
+    """Read-only: True once this conversation's call/stream has been closed (tombstoned
+    by a failed turn or a hang-up). Changes no session state."""
+    session = _SESSIONS_BY_KEY.get(session_key)
+    return session is not None and session.closed

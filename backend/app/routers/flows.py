@@ -38,6 +38,7 @@ from app.db import (
     insert_test_case,
     list_agent_flows,
     update_run,
+    update_test_case,
 )
 
 router = APIRouter(tags=["flows"])
@@ -209,6 +210,9 @@ class SaveNodeTest(BaseModel):
     """The reviewed test goal + script for one node, ready to persist (Phase 3)."""
     test_goal: str
     script: list[dict]
+    # Set when re-saving a script this node's workspace already saved once — updates
+    # that row in place instead of inserting a duplicate. Omitted/None on first save.
+    test_id: int | None = None
 
 
 @router.post("/flows/{flow_id}/nodes/{node_id}/test")
@@ -218,9 +222,12 @@ def save_node_test(flow_id: int, node_id: str, body: SaveNodeTest) -> dict:
     Same table, same columns (title/user_goal/test_type/assigned_fault/
     expected_behavior/seed_turns_json/source) every other test case uses, plus the
     flow_id/node_id/node_script_json columns added for this feature — see
-    app.core.node_script.to_scenario_dict for the conversion. A single INSERT: saving
-    one node test never touches any other test case already saved for this agent
-    (contrast the dashboard's "save reviewed suite", which replaces the whole set).
+    app.core.node_script.to_scenario_dict for the conversion. Without `test_id` this is
+    a single INSERT that never touches any other test case already saved for this
+    agent (contrast the dashboard's "save reviewed suite", which replaces the whole
+    set). With `test_id`, it UPDATEs that same row in place instead — re-saving an
+    edited/regenerated script for a node the workspace already saved once must not
+    silently accumulate duplicate test cases.
 
     Rejects a malformed script outright (missing/empty caller_line or
     expected_agent_behavior, non-string fields, empty or oversized script) — never
@@ -258,11 +265,26 @@ def save_node_test(flow_id: int, node_id: str, body: SaveNodeTest) -> dict:
     normalized["node_id"] = node_id
     normalized["node_script_json"] = raw["node_script_json"]
 
-    customer_agent_id = _resolve_customer_agent_id(flow["agent_id"])
-    test_id = insert_test_case(
-        customer_agent_id, normalized, source="user",
-        flow_id=flow_id, node_id=node_id, node_script_json=normalized["node_script_json"],
-    )
+    if body.test_id is not None:
+        existing = get_test_case(body.test_id)
+        if (
+            existing is None
+            or existing.get("flow_id") != flow_id
+            or existing.get("node_id") != node_id
+        ):
+            raise HTTPException(
+                status_code=404,
+                detail=f"test {body.test_id} not found for flow {flow_id}, node '{node_id}'",
+            )
+        update_test_case(body.test_id, normalized, node_script_json=normalized["node_script_json"])
+        test_id = body.test_id
+        customer_agent_id = existing["customer_agent_id"]
+    else:
+        customer_agent_id = _resolve_customer_agent_id(flow["agent_id"])
+        test_id = insert_test_case(
+            customer_agent_id, normalized, source="user",
+            flow_id=flow_id, node_id=node_id, node_script_json=normalized["node_script_json"],
+        )
 
     return {
         "test_id": test_id, "flow_id": flow_id, "node_id": node_id, "node_name": node["name"],

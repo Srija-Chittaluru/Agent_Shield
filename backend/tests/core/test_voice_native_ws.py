@@ -4,9 +4,6 @@ No real network, no real DB: httpx and websockets are replaced with the scripted
 fakes in fakes_native_ws.py. Each test clears the module-level session registry
 first, since it's process-global state keyed by session_key.
 """
-import asyncio
-import time
-
 import pytest
 
 from app.core import voice_native_ws as nws
@@ -285,160 +282,21 @@ async def test_peek_greeting_returns_none_once_session_already_tombstoned(monkey
 
 
 # ---------------------------------------------------------------------------
-# Binary-frame (real agent audio) capture — _next_agent_turn / _drain_trailing_audio
+# Binary frames must not break turn detection (the conversation-recording feature
+# that used to capture them has been removed — see _next_agent_turn's docstring).
 # ---------------------------------------------------------------------------
 
-async def test_binary_frames_before_the_turn_event_are_captured_not_discarded():
-    ws = FakeWebSocket(incoming=[
-        b"pre-turn-audio-chunk",
-        turn_frame("agent", "hello there"),
-    ])
-    result = await nws._next_agent_turn(ws)
-    assert result["text"] == "hello there"
-    assert result["_audio_pcm16"] == b"pre-turn-audio-chunk"
-
-
-async def test_binary_frames_after_the_turn_event_are_also_captured_via_drain():
-    """The target may still be streaming a turn's TTS audio when the "turn" JSON
-    event arrives (see the module docstring) — frames queued AFTER it must still
-    end up in the same turn's captured audio, not be dropped."""
-    ws = FakeWebSocket(incoming=[
-        turn_frame("agent", "hello there"),
-        b"post-turn-audio-chunk-1",
-        b"post-turn-audio-chunk-2",
-    ])
-    result = await nws._next_agent_turn(ws)
-    assert result["text"] == "hello there"
-    assert result["_audio_pcm16"] == b"post-turn-audio-chunk-1post-turn-audio-chunk-2"
-
-
-async def test_audio_before_and_after_the_turn_event_is_concatenated_in_order():
-    ws = FakeWebSocket(incoming=[
-        b"before",
-        turn_frame("agent", "hi"),
-        b"after",
-    ])
-    result = await nws._next_agent_turn(ws)
-    assert result["_audio_pcm16"] == b"beforeafter"
-
-
-async def test_next_agent_turn_still_skips_non_audio_non_turn_frames():
-    """Existing behavior (caller echo, speaking/interruption text frames) must be
-    unaffected by audio capture — only the "turn"/agent text event stops the loop."""
+async def test_next_agent_turn_skips_binary_and_non_turn_text_frames():
+    """Caller echo, speaking/interruption text frames, and any binary frame the
+    target sends must all be silently skipped — only the "turn"/agent text event
+    stops the loop."""
     import json
 
     ws = FakeWebSocket(incoming=[
         turn_frame("caller", "echo of what the tester said"),
         json.dumps({"type": "speaking", "speaking": True}),
-        b"actual-agent-audio",
+        b"some-binary-frame-the-target-sends",
         turn_frame("agent", "the real reply"),
     ])
     result = await nws._next_agent_turn(ws)
     assert result["text"] == "the real reply"
-    assert result["_audio_pcm16"] == b"actual-agent-audio"
-
-
-async def test_no_audio_at_all_yields_empty_bytes_not_an_error():
-    ws = FakeWebSocket(incoming=[turn_frame("agent", "text only, no audio ever sent")])
-    result = await nws._next_agent_turn(ws)
-    assert result["_audio_pcm16"] == b""
-
-
-class _TimedFakeWebSocket:
-    """Unlike FakeWebSocket (which raises the instant its queue is empty),
-    recv() here genuinely awaits — real delays for scripted items, and an
-    (effectively) permanent hang once the queue is exhausted if `hang_after` is
-    set. Lets a test prove _drain_trailing_audio's timeouts are REAL asyncio
-    timeouts, not just "the fake ran out of things to say"."""
-
-    def __init__(self, items: list[tuple[float, bytes]], hang_after: bool = False):
-        self._items = list(items)
-        self._hang_after = hang_after
-
-    async def recv(self):
-        if not self._items:
-            if self._hang_after:
-                await asyncio.sleep(100)
-            raise RuntimeError("FakeWebSocket exhausted")
-        delay, payload = self._items.pop(0)
-        await asyncio.sleep(delay)
-        return payload
-
-
-async def test_drain_stops_after_idle_gap_without_hanging(monkeypatch):
-    """Bounded on the idle side: once the socket goes quiet for _POST_TURN_IDLE_S,
-    the drain stops promptly rather than hanging until _POST_TURN_MAX_S."""
-    monkeypatch.setattr(nws, "_POST_TURN_IDLE_S", 0.05)
-    monkeypatch.setattr(nws, "_POST_TURN_MAX_S", 5.0)  # generous — must not be what triggers the stop
-    ws = _TimedFakeWebSocket([], hang_after=True)
-
-    start = time.monotonic()
-    result = await nws._drain_trailing_audio(ws, [b"already-had-this"])
-    elapsed = time.monotonic() - start
-
-    assert result == b"already-had-this"
-    assert elapsed < 1.0  # stopped by the idle timeout, not by waiting anywhere near 5s
-
-
-async def test_drain_stops_at_hard_cap_despite_continuous_frames(monkeypatch):
-    """Bounded on the total-time side: frames arriving faster than the idle timeout
-    would never trigger it, so the hard cap must be what stops this — proving the
-    drain can never wait indefinitely even against a chatty/misbehaving target."""
-    monkeypatch.setattr(nws, "_POST_TURN_IDLE_S", 1.0)   # generous per-frame allowance
-    monkeypatch.setattr(nws, "_POST_TURN_MAX_S", 0.15)   # tiny hard cap
-    items = [(0.02, f"frame-{i}".encode()) for i in range(200)]  # would run for ~4s unbounded
-    ws = _TimedFakeWebSocket(items)
-
-    start = time.monotonic()
-    result = await nws._drain_trailing_audio(ws, [])
-    elapsed = time.monotonic() - start
-
-    assert elapsed < 1.0  # bounded by _POST_TURN_MAX_S, not by exhausting 200 frames
-    assert len(result) > 0
-    assert len(result) < sum(len(p) for _, p in items)  # did NOT drain everything
-
-
-async def test_drain_stops_on_socket_error_returns_what_it_had():
-    class _Boom:
-        async def recv(self):
-            raise ConnectionError("socket died mid-drain")
-
-    result = await nws._drain_trailing_audio(_Boom(), [b"captured-before-the-error"])
-    assert result == b"captured-before-the-error"
-
-
-async def test_drain_stops_on_a_text_frame_arriving():
-    """A text frame during the drain window isn't this turn's trailing audio —
-    stop rather than silently swallowing it or misattributing it."""
-    ws = FakeWebSocket(incoming=[b"audio-1", turn_frame("agent", "unrelated next thing")])
-    result = await nws._drain_trailing_audio(ws, [b"audio-0"])
-    assert result == b"audio-0audio-1"
-
-
-async def test_long_turn_audio_is_not_truncated_at_the_old_3s_cap():
-    """Direct regression for the real Maya truncation bug: a live, frame-by-frame
-    capture against the actual target showed one turn's real TTS audio streamed
-    continuously for 11.84s (296 frames of 1280 bytes each, ~40ms apart, no gap
-    ever near _POST_TURN_IDLE_S) — and the OLD _POST_TURN_MAX_S=3.0 silently cut
-    it down to 2.6s (65 frames). This test replays those exact real numbers
-    against the CURRENT, unpatched production constants (no monkeypatching
-    _POST_TURN_MAX_S/_POST_TURN_IDLE_S) — a faithful reproduction of the original
-    bug, not an abstract timing test — and asserts the full turn is captured.
-
-    Runs in real wall-clock time (~12s) since it deliberately does NOT scale down
-    the constants — that's the whole point: proving the production ceiling itself,
-    not a proportional stand-in for it.
-    """
-    frame_bytes = 1280
-    frame_interval_s = 0.04  # matches Maya's real observed streaming cadence
-    num_frames = 296          # matches the real turn that produced 11.84s of audio
-
-    items = [(frame_interval_s, bytes([i % 256]) * frame_bytes) for i in range(num_frames)]
-    ws = _TimedFakeWebSocket(items)
-
-    result = await nws._drain_trailing_audio(ws, [])
-
-    assert len(result) == num_frames * frame_bytes  # every frame captured, none dropped
-    # Under the OLD 3.0s cap this same stream would have yielded only ~65 frames
-    # (83,200 bytes) — assert we now get well beyond that.
-    assert len(result) > 65 * frame_bytes

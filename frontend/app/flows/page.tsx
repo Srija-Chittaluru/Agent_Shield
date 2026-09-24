@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   ShieldCheck,
   Upload,
@@ -20,6 +20,7 @@ import {
   MessageSquare,
   Save,
   PlayCircle,
+  Trash2,
 } from "lucide-react";
 import {
   getInventory,
@@ -46,11 +47,11 @@ import { TranscriptDetails } from "../dashboard/page";
 // review/edit it.
 // Phase 3 (this file also covers it): save the reviewed script as a real test case,
 // then run it through the EXISTING Temporal execution pipeline — the same
-// AgentTestWorkflow/RunGroupWorkflow, scripted runner, voice protocols, recording and
-// Judge every other test uses (see backend/app/routers/flows.py and
+// AgentTestWorkflow/RunGroupWorkflow, scripted runner, voice protocols, and Judge
+// every other test uses (see backend/app/routers/flows.py and
 // app/core/node_script.py). This introduces no second voice-testing engine. Results
-// are shown here by reusing the dashboard's own transcript/recording view
-// (TranscriptDetails, imported from ../dashboard/page) rather than duplicating it.
+// are shown here by reusing the dashboard's own transcript view (TranscriptDetails,
+// imported from ../dashboard/page) rather than duplicating it.
 
 interface UploadDiagnostics {
   top_level_keys?: string[];
@@ -100,7 +101,16 @@ export default function FlowsPage() {
   const [script, setScript] = useState<NodeScriptTurn[] | null>(null);
   const [generating, setGenerating] = useState(false);
   const [genErrors, setGenErrors] = useState<string[] | null>(null);
-  const [hasGenerated, setHasGenerated] = useState(false);
+  // `dirty` tracks whether the current draft differs from whatever was last saved,
+  // so Save/Run know whether a (re)save is needed and, when it is, whether to insert
+  // a new test case or update the one already saved for this node.
+  const [dirty, setDirty] = useState(false);
+  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
+
+  // Brings the Node Test section into view the moment a node is selected, instead of
+  // requiring a manual scroll past the node list — never fires on initial page load
+  // since selectedNodeId starts null and only changes via an explicit node click.
+  const nodeTestRef = useRef<HTMLDivElement | null>(null);
 
   // Phase 3 — save the reviewed script, then run it through the existing pipeline.
   const [savedTest, setSavedTest] = useState<SavedNodeTest | null>(null);
@@ -111,6 +121,10 @@ export default function FlowsPage() {
   const [running, setRunning] = useState(false);
   const [runErrors, setRunErrors] = useState<string[] | null>(null);
   const [report, setReport] = useState<Report | null>(null);
+
+  useEffect(() => {
+    if (selectedNodeId) nodeTestRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+  }, [selectedNodeId]);
 
   useEffect(() => {
     getInventory().then(async (inv) => {
@@ -228,6 +242,12 @@ export default function FlowsPage() {
     [flow, selectedNodeId]
   );
 
+  // Explicit script state (see the pasted UX spec's "SCRIPT STATE" section): drives
+  // which helper text/badge shows without adding a separate state-management layer —
+  // it's derived from the existing script/savedTest/dirty pieces above.
+  type ScriptStatus = "none" | "draft" | "saved" | "modified";
+  const scriptStatus: ScriptStatus = !script ? "none" : !savedTest ? "draft" : dirty ? "modified" : "saved";
+
   function resetSaveAndRunState() {
     setSavedTest(null);
     setSaveErrors(null);
@@ -236,6 +256,8 @@ export default function FlowsPage() {
     setRunning(false);
     setRunErrors(null);
     setReport(null);
+    setDirty(false);
+    setShowDeleteConfirm(false);
   }
 
   function selectNode(nodeId: string) {
@@ -243,7 +265,6 @@ export default function FlowsPage() {
     setSelectedNodeId(nodeId);
     setTestGoal("");
     setScript(null);
-    setHasGenerated(false);
     setGenErrors(null);
     resetSaveAndRunState();
   }
@@ -257,7 +278,6 @@ export default function FlowsPage() {
       const result = await generateNodeScript(flow.id, selectedNodeId, testGoal.trim() || undefined);
       setTestGoal(result.test_goal);
       setScript(result.script);
-      setHasGenerated(true);
     } catch (err) {
       setGenErrors(extractErrors(err instanceof Error ? err.message : String(err)));
     } finally {
@@ -272,11 +292,36 @@ export default function FlowsPage() {
       next[index] = { ...next[index], [field]: value };
       return next;
     });
-    setSavedTest(null); // an edited script no longer matches what (if anything) was saved
+    setDirty(true); // no-op while there's nothing saved yet (scriptStatus ignores it until then)
+  }
+
+  function onTestGoalChange(value: string) {
+    setTestGoal(value);
+    setDirty(true);
+  }
+
+  function onDeleteDraft() {
+    setScript(null);
+    setGenErrors(null);
+    resetSaveAndRunState(); // clears the local draft/save link only — the persisted
+    // test_cases row (if any) is left untouched, per the "never silently delete a
+    // saved test case" requirement.
+  }
+
+  // Shared by Save and the Run auto-save path — persists the current draft, updating
+  // the row from a prior save of THIS node instead of inserting a duplicate.
+  async function persistScript(): Promise<SavedNodeTest> {
+    if (!flow || !selectedNodeId || !script || !testGoal.trim()) {
+      throw new Error("Generate a script and enter a test goal before saving.");
+    }
+    const result = await saveNodeTest(flow.id, selectedNodeId, testGoal.trim(), script, savedTest?.test_id);
+    setSavedTest(result);
+    setDirty(false);
+    return result;
   }
 
   async function onSaveTest() {
-    if (!flow || !selectedNodeId || !script || !testGoal.trim()) return;
+    if (!script || !testGoal.trim()) return;
     setSaving(true);
     setSaveErrors(null);
     setRunId(null);
@@ -284,8 +329,7 @@ export default function FlowsPage() {
     setReport(null);
     setRunErrors(null);
     try {
-      const result = await saveNodeTest(flow.id, selectedNodeId, testGoal.trim(), script);
-      setSavedTest(result);
+      await persistScript();
     } catch (err) {
       setSaveErrors(extractErrors(err instanceof Error ? err.message : String(err)));
     } finally {
@@ -293,18 +337,29 @@ export default function FlowsPage() {
     }
   }
 
+  // RUN: save first only if there's nothing saved yet, or the draft has changed since
+  // the last save — otherwise reuse the existing saved test id as-is. Either way, the
+  // existing save/run APIs are the only path; there's no second execution route.
   async function onRunTest() {
-    if (!flow || !selectedNodeId || !savedTest) return;
+    if (!flow || !selectedNodeId || !script || !testGoal.trim()) return;
     setRunning(true);
     setRunErrors(null);
     setReport(null);
     try {
-      const result = await runNodeTest(flow.id, selectedNodeId, savedTest.test_id);
+      let testId = savedTest?.test_id ?? null;
+      if (!savedTest || dirty) {
+        setSaving(true);
+        const saved = await persistScript();
+        testId = saved.test_id;
+        setSaving(false);
+      }
+      const result = await runNodeTest(flow.id, selectedNodeId, testId as number);
       setRunStatus("queued");
       setRunId(result.run_id);
     } catch (err) {
       setRunErrors(extractErrors(err instanceof Error ? err.message : String(err)));
       setRunning(false);
+      setSaving(false);
     }
   }
 
@@ -622,11 +677,12 @@ export default function FlowsPage() {
 
         {/* Step 4: selected node -> test goal -> deterministic script (Phase 2) */}
         {selectedNode && (
-          <div className="mt-6 rounded-xl border border-white/12 bg-white/2 p-6">
+          <div ref={nodeTestRef} className="mt-6 scroll-mt-24 rounded-xl border border-white/12 bg-white/2 p-6">
             <label className="block text-sm font-medium text-[#F8FAFC]">4. Node test</label>
 
             <div className="mt-3 rounded-lg border border-white/10 bg-black/30 p-4">
-              <div className="flex items-center gap-2">
+              <p className="text-[10px] font-medium uppercase tracking-wide text-[#9CA3AF]">Selected node</p>
+              <div className="mt-1.5 flex items-center gap-2">
                 <Target className="h-4 w-4 text-[#9CA3AF]" strokeWidth={1.5} />
                 <h3 className="font-medium text-[#F8FAFC]">{selectedNode.name}</h3>
                 <span className="text-xs text-[#9CA3AF]">({selectedNode.id})</span>
@@ -643,26 +699,26 @@ export default function FlowsPage() {
             </p>
             <textarea
               value={testGoal}
-              onChange={(e) => setTestGoal(e.target.value)}
+              onChange={(e) => onTestGoalChange(e.target.value)}
               placeholder="e.g. Verify the agent rejects an incorrect name before accepting the correct one."
               rows={2}
               className="mt-2 w-full resize-y rounded-lg border border-white/15 bg-black/40 px-3 py-2 text-sm text-[#F8FAFC] outline-none focus:border-white/40"
             />
 
-            <button
-              onClick={onGenerateScript}
-              disabled={generating}
-              className="mt-3 inline-flex items-center gap-2 rounded-lg border border-white/20 bg-white/8 px-4 py-2 text-sm font-medium text-[#F8FAFC] transition hover:bg-white/15 disabled:opacity-50"
-            >
-              {generating ? (
-                <Loader2 className="h-4 w-4 animate-spin" strokeWidth={1.5} />
-              ) : hasGenerated ? (
-                <RotateCcw className="h-4 w-4" strokeWidth={1.5} />
-              ) : (
-                <Wand2 className="h-4 w-4" strokeWidth={1.5} />
-              )}
-              {generating ? "Generating…" : hasGenerated ? "Regenerate Test Script" : "Generate Test Script"}
-            </button>
+            {!script && (
+              <button
+                onClick={onGenerateScript}
+                disabled={generating}
+                className="mt-3 inline-flex items-center gap-2 rounded-lg border border-white/20 bg-white/8 px-4 py-2 text-sm font-medium text-[#F8FAFC] transition hover:bg-white/15 disabled:opacity-50"
+              >
+                {generating ? (
+                  <Loader2 className="h-4 w-4 animate-spin" strokeWidth={1.5} />
+                ) : (
+                  <Wand2 className="h-4 w-4" strokeWidth={1.5} />
+                )}
+                {generating ? "Generating…" : "Generate Test Script"}
+              </button>
+            )}
 
             {genErrors && (
               <div className="mt-3 rounded-lg border border-rose-400/30 bg-rose-400/10 px-3 py-2 text-sm text-rose-300">
@@ -680,7 +736,24 @@ export default function FlowsPage() {
 
             {script && (
               <div className="mt-6">
-                <label className="block text-sm font-medium text-[#F8FAFC]">Generated test script</label>
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <label className="block text-sm font-medium text-[#F8FAFC]">Generated test script</label>
+                  {scriptStatus === "saved" && (
+                    <span className="rounded-full border border-emerald-400/30 bg-emerald-400/10 px-2.5 py-0.5 text-[11px] font-medium text-emerald-300">
+                      Saved as test #{savedTest?.test_id}
+                    </span>
+                  )}
+                  {scriptStatus === "modified" && (
+                    <span className="rounded-full border border-amber-400/30 bg-amber-400/10 px-2.5 py-0.5 text-[11px] font-medium text-amber-300">
+                      Unsaved changes
+                    </span>
+                  )}
+                  {scriptStatus === "draft" && (
+                    <span className="rounded-full border border-white/15 px-2.5 py-0.5 text-[11px] font-medium text-[#9CA3AF]">
+                      Draft — not saved yet
+                    </span>
+                  )}
+                </div>
 
                 <div className="mt-2 flex items-start gap-2 rounded-lg border border-sky-400/25 bg-sky-400/10 px-3 py-2 text-xs text-sky-200">
                   <Info className="mt-0.5 h-3.5 w-3.5 shrink-0" strokeWidth={1.5} />
@@ -727,22 +800,89 @@ export default function FlowsPage() {
 
                 <p className="mt-4 flex items-center gap-1.5 text-xs text-[#9CA3AF]">
                   <MessageSquare className="h-3.5 w-3.5" strokeWidth={1.5} />
-                  Review and edit the script above, then save it before running it against the
-                  Voice Agent.
+                  Caller lines are executed exactly as written during the test&#8202;— edit
+                  them directly above, then save and run against the Voice Agent.
                 </p>
 
-                <button
-                  onClick={onSaveTest}
-                  disabled={saving || !testGoal.trim()}
-                  className="mt-4 inline-flex items-center gap-2 rounded-lg border border-white/20 bg-white/8 px-4 py-2 text-sm font-medium text-[#F8FAFC] transition hover:bg-white/15 disabled:opacity-50"
-                >
-                  {saving ? (
-                    <Loader2 className="h-4 w-4 animate-spin" strokeWidth={1.5} />
-                  ) : (
-                    <Save className="h-4 w-4" strokeWidth={1.5} />
-                  )}
-                  {saving ? "Saving…" : savedTest ? "Saved ✓ (save again to update)" : "Save Test"}
-                </button>
+                {/* Compact secondary actions: Regenerate / Delete. */}
+                <div className="mt-4 flex flex-wrap items-center gap-2">
+                  <button
+                    onClick={onGenerateScript}
+                    disabled={generating}
+                    className="inline-flex items-center gap-1.5 rounded-full border border-white/15 px-3 py-1.5 text-xs font-medium text-[#9CA3AF] transition hover:border-white/30 hover:text-white disabled:opacity-50"
+                  >
+                    {generating ? (
+                      <Loader2 className="h-3.5 w-3.5 animate-spin" strokeWidth={1.5} />
+                    ) : (
+                      <RotateCcw className="h-3.5 w-3.5" strokeWidth={1.5} />
+                    )}
+                    {generating ? "Regenerating…" : "Regenerate"}
+                  </button>
+                  <button
+                    onClick={() => setShowDeleteConfirm(true)}
+                    className="inline-flex items-center gap-1.5 rounded-full border border-rose-400/25 px-3 py-1.5 text-xs font-medium text-rose-300 transition hover:border-rose-400/50 hover:bg-rose-400/10"
+                  >
+                    <Trash2 className="h-3.5 w-3.5" strokeWidth={1.5} />
+                    Delete
+                  </button>
+                </div>
+
+                {showDeleteConfirm && (
+                  <div className="mt-3 rounded-lg border border-rose-400/30 bg-rose-400/10 px-3 py-3 text-sm text-rose-200">
+                    <p>
+                      {savedTest
+                        ? `This clears the draft here in the workspace. Saved test #${savedTest.test_id} stays stored and can still be run or found elsewhere — it will not be deleted.`
+                        : "Discard this generated draft? It hasn't been saved anywhere."}
+                    </p>
+                    <div className="mt-2 flex gap-2">
+                      <button
+                        onClick={() => {
+                          onDeleteDraft();
+                        }}
+                        className="rounded-full border border-rose-400/40 px-3 py-1 text-xs font-medium text-rose-200 transition hover:bg-rose-400/20"
+                      >
+                        Clear Draft
+                      </button>
+                      <button
+                        onClick={() => setShowDeleteConfirm(false)}
+                        className="rounded-full border border-white/15 px-3 py-1 text-xs text-[#9CA3AF] transition hover:border-white/30 hover:text-white"
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                {/* Primary actions: Save + Run are both visible as soon as a draft exists. */}
+                <div className="mt-5 flex flex-wrap items-center gap-3">
+                  <button
+                    onClick={onSaveTest}
+                    disabled={saving || !testGoal.trim()}
+                    className="inline-flex items-center gap-2 rounded-lg border border-white/20 bg-white/8 px-4 py-2 text-sm font-medium text-[#F8FAFC] transition hover:bg-white/15 disabled:opacity-50"
+                  >
+                    {saving ? (
+                      <Loader2 className="h-4 w-4 animate-spin" strokeWidth={1.5} />
+                    ) : (
+                      <Save className="h-4 w-4" strokeWidth={1.5} />
+                    )}
+                    {saving ? "Saving…" : "Save Test"}
+                  </button>
+                  <button
+                    onClick={onRunTest}
+                    disabled={running || !testGoal.trim()}
+                    className="inline-flex items-center gap-2 rounded-lg border border-emerald-400/40 bg-emerald-400/15 px-4 py-2 text-sm font-medium text-emerald-200 transition hover:bg-emerald-400/25 disabled:opacity-50"
+                  >
+                    {running ? (
+                      <Loader2 className="h-4 w-4 animate-spin" strokeWidth={1.5} />
+                    ) : (
+                      <PlayCircle className="h-4 w-4" strokeWidth={1.5} />
+                    )}
+                    {running ? "Running…" : "Run Test"}
+                  </button>
+                </div>
+                <p className="mt-2 text-xs text-[#9CA3AF]">
+                  Run Test automatically saves changes before starting.
+                </p>
 
                 {saveErrors && (
                   <div className="mt-3 rounded-lg border border-rose-400/30 bg-rose-400/10 px-3 py-2 text-sm text-rose-300">
@@ -755,28 +895,6 @@ export default function FlowsPage() {
                         <li key={i}>{e}</li>
                       ))}
                     </ul>
-                  </div>
-                )}
-
-                {/* Run Test only ever appears once the CURRENT script has been saved. */}
-                {savedTest && (
-                  <div className="mt-4 rounded-lg border border-emerald-400/25 bg-emerald-400/5 px-3 py-2">
-                    <p className="flex items-center gap-1.5 text-xs text-emerald-300">
-                      <CheckCircle2 className="h-3.5 w-3.5 shrink-0" strokeWidth={1.5} />
-                      Saved as test #{savedTest.test_id} for {savedTest.node_name}.
-                    </p>
-                    <button
-                      onClick={onRunTest}
-                      disabled={running}
-                      className="mt-3 inline-flex items-center gap-2 rounded-lg border border-emerald-400/40 bg-emerald-400/15 px-4 py-2 text-sm font-medium text-emerald-200 transition hover:bg-emerald-400/25 disabled:opacity-50"
-                    >
-                      {running ? (
-                        <Loader2 className="h-4 w-4 animate-spin" strokeWidth={1.5} />
-                      ) : (
-                        <PlayCircle className="h-4 w-4" strokeWidth={1.5} />
-                      )}
-                      {running ? "Running…" : "Run Test"}
-                    </button>
                   </div>
                 )}
 
@@ -803,7 +921,7 @@ export default function FlowsPage() {
                   </div>
                 )}
 
-                {/* Result — reuses the dashboard's own transcript/recording view. */}
+                {/* Result — reuses the dashboard's own transcript view. */}
                 {report && report.conversations[0] && (
                   <div className="mt-6 rounded-lg border border-white/12 bg-black/30 p-4">
                     <div className="flex items-center justify-between gap-2">
@@ -839,8 +957,6 @@ export default function FlowsPage() {
                     <TranscriptDetails
                       messages={report.conversations[0].messages}
                       label="Transcript"
-                      recordingUrl={report.conversations[0].recording_url}
-                      recordingAgentOnly={report.conversations[0].recording_agent_only}
                     />
                   </div>
                 )}

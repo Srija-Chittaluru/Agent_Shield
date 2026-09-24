@@ -202,18 +202,11 @@ def init_schema() -> None:
         ALTER TABLE scenarios ADD COLUMN IF NOT EXISTS max_turns INTEGER;
         ALTER TABLE test_cases ADD COLUMN IF NOT EXISTS max_turns INTEGER;
 
-        -- Local filesystem path to this conversation's WAV recording (see
-        -- app.core.recording), if one was produced. NULL for every chat conversation
-        -- and any voice conversation that failed before its first turn's audio was
-        -- ever produced/received.
-        ALTER TABLE conversations ADD COLUMN IF NOT EXISTS recording_path TEXT;
-
-        -- True iff recording_path contains ONLY the agent's audio (native_ws — that
-        -- protocol drives the caller via text, so no real caller audio ever exists;
-        -- see app.core.recording's docstring). NULL/false for http_json/websocket/
-        -- twilio, which always represent both sides where recorded at all, and for
-        -- every conversation with no recording (meaningless there either way).
-        ALTER TABLE conversations ADD COLUMN IF NOT EXISTS recording_agent_only BOOLEAN;
+        -- Conversation recording feature removed — these two columns (path to a WAV
+        -- file, and whether it held agent-only audio) existed solely to support it.
+        -- Dropped rather than left behind, same pattern already used for `persona`.
+        ALTER TABLE conversations DROP COLUMN IF EXISTS recording_path;
+        ALTER TABLE conversations DROP COLUMN IF EXISTS recording_agent_only;
 
         -- Flow-aware / node-based voice testing — Phase 1 only (upload, parse, store,
         -- display; nothing here is wired to execution yet). One row per uploaded flow
@@ -660,23 +653,6 @@ def update_conversation_fix(
     conn.close()
 
 
-def set_conversation_recording(conversation_id: int, path: str, agent_only: bool = False) -> None:
-    """Record where this conversation's WAV recording (app.core.recording) landed,
-    and whether it's agent-audio-only (native_ws — see that module's docstring).
-
-    Called exactly once, from app.core.voice_caller.close_voice_session(), only when
-    a recording actually has content to write — see that function and
-    app.core.recording.finalize_recording().
-    """
-    conn = get_conn()
-    conn.execute(
-        "UPDATE conversations SET recording_path = %s, recording_agent_only = %s WHERE id = %s",
-        (path, agent_only, conversation_id),
-    )
-    conn.commit()
-    conn.close()
-
-
 def build_conversation_payload(conversation_id: int) -> dict | None:
     """Assemble one conversation for the report: scenario meta + scores + messages+trace."""
     conv = get_conversation(conversation_id)
@@ -722,17 +698,6 @@ def build_conversation_payload(conversation_id: int) -> dict | None:
         "suggested_fix": conv.get("suggested_fix"),
         "evidence": conv.get("evidence"),
         "messages": messages,
-        # A ready-to-use URL, not the raw server filesystem path — GET it from
-        # app.routers.conversations. None whenever no recording exists (chat, or a
-        # voice conversation that failed before any audio was produced/received —
-        # see app.core.recording's docstring).
-        "recording_url": (
-            f"/conversations/{conv['id']}/recording" if conv.get("recording_path") else None
-        ),
-        # True iff recording_url, when present, contains ONLY the agent's audio
-        # (native_ws — see app.core.recording's docstring). Always False/irrelevant
-        # when recording_url is None.
-        "recording_agent_only": bool(conv.get("recording_agent_only")),
     }
 
 
@@ -860,6 +825,27 @@ def insert_test_case(
     conn.commit()
     conn.close()
     return tid
+
+
+def update_test_case(test_case_id: int, tc: dict, node_script_json: str | None = None) -> None:
+    """Update an existing test_cases row in place, keeping its id.
+
+    Used for re-saving a flow-node test after an edit/regenerate: reuses the row a
+    prior save already created instead of inserting a duplicate (contrast
+    insert_test_case, which always creates a new row).
+    """
+    conn = get_conn()
+    conn.execute(
+        """UPDATE test_cases
+           SET title=%s, user_goal=%s, test_type=%s, assigned_fault=%s,
+               expected_behavior=%s, seed_turns_json=%s, node_script_json=%s
+           WHERE id=%s""",
+        (tc.get("title"), tc.get("user_goal"), tc.get("test_type"), tc.get("assigned_fault"),
+         tc.get("expected_behavior"), _json.dumps(tc.get("seed_turns", [])), node_script_json,
+         test_case_id),
+    )
+    conn.commit()
+    conn.close()
 
 
 def get_test_case(test_case_id: int) -> dict | None:

@@ -498,15 +498,6 @@ async def handle_media_stream(websocket: Any) -> None:
                 })
                 await asyncio.sleep(SEND_PACING_S)
 
-            # Recording (app.core.recording): the REAL mu-law audio just sent is
-            # exactly what the caller side of the call recording should contain — no
-            # separate synthesis. Lazy import to avoid a module-load cycle (recording
-            # imports helpers FROM this module; see recording.py's docstring).
-            if request.frames:
-                from app.core.recording import append_mulaw
-
-                append_mulaw(session.session_key, b"".join(request.frames))
-
             # buffer the agent's reply until silence/timeout — a FRESH buffer every
             # turn, so Turn 1's audio can never become part of Turn 2's response
             buffer = bytearray()
@@ -540,11 +531,6 @@ async def handle_media_stream(websocket: Any) -> None:
 
             if not request.result.done():
                 request.result.set_result({"audio": bytes(buffer), "error": None})
-
-            if buffer:
-                from app.core.recording import append_mulaw
-
-                append_mulaw(session.session_key, bytes(buffer))
 
             if stream_ended:
                 await _teardown(session, error="media stream ended")

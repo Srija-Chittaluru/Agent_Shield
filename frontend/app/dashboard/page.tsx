@@ -247,61 +247,21 @@ export function Transcript({ messages }: { messages: Message[] }) {
   );
 }
 
-// Reuses the SAME `messages`/verdict data the transcript already renders from —
-// recording_url is just one more field on that same conversation payload
-// (backend/app/db.py's build_conversation_payload), nothing new fetched here.
-export function RecordingPlayer({
-  url,
-  agentOnly,
-}: {
-  url: string | null | undefined;
-  agentOnly?: boolean;
-}) {
-  if (!url) {
-    return (
-      <p className="mt-3 flex items-center gap-1.5 text-xs text-slate-500">
-        <Mic className="h-3.5 w-3.5 shrink-0" strokeWidth={1.5} />
-        No recording available
-      </p>
-    );
-  }
-  return (
-    <div className="mt-3">
-      <div className="flex items-center gap-2">
-        <Mic className="h-3.5 w-3.5 shrink-0 text-slate-400" strokeWidth={1.5} />
-        <audio controls preload="none" src={`${API_BASE}${url}`} className="h-8 w-full max-w-sm" />
-      </div>
-      {agentOnly && (
-        <p className="mt-1.5 pl-5 text-[11px] text-slate-500">
-          Agent audio only — this protocol drives the caller via text, so no caller audio exists.
-        </p>
-      )}
-    </div>
-  );
-}
-
 export function TranscriptDetails({
   messages,
   label,
-  recordingUrl,
-  recordingAgentOnly,
 }: {
   messages: Message[];
   label: string;
-  recordingUrl?: string | null;
-  recordingAgentOnly?: boolean;
 }) {
   return (
-    <>
-      <RecordingPlayer url={recordingUrl} agentOnly={recordingAgentOnly} />
-      <details className="group mt-2">
-        <summary className="flex cursor-pointer list-none items-center gap-2 text-xs font-medium text-slate-400 transition-colors hover:text-slate-200">
-          <ArrowRight className="h-3.5 w-3.5 transition-transform group-open:rotate-90" />
-          {label}
-        </summary>
-        <Transcript messages={messages} />
-      </details>
-    </>
+    <details className="group mt-2">
+      <summary className="flex cursor-pointer list-none items-center gap-2 text-xs font-medium text-slate-400 transition-colors hover:text-slate-200">
+        <ArrowRight className="h-3.5 w-3.5 transition-transform group-open:rotate-90" />
+        {label}
+      </summary>
+      <Transcript messages={messages} />
+    </details>
   );
 }
 
@@ -978,8 +938,6 @@ export default function DashboardPage() {
         fix: c.suggested_fix || "",
         evidence: c.evidence || "",
         messages: c.messages || [],
-        recordingUrl: c.recording_url || null,
-        recordingAgentOnly: !!c.recording_agent_only,
       }));
   }, [report]);
 
@@ -990,8 +948,6 @@ export default function DashboardPage() {
         scenario: c.scenario_title || "Untitled scenario",
         category: prettify(c.test_type),
         messages: c.messages || [],
-        recordingUrl: c.recording_url || null,
-        recordingAgentOnly: !!c.recording_agent_only,
       }));
   }, [report]);
 
@@ -1883,8 +1839,6 @@ export default function DashboardPage() {
                         <TranscriptDetails
                           messages={row.messages}
                           label={`View what AgentShield asked & how it broke (${row.messages.length} turns)`}
-                          recordingUrl={row.recordingUrl}
-                          recordingAgentOnly={row.recordingAgentOnly}
                         />
                       </div>
                     ))}
@@ -1943,8 +1897,6 @@ export default function DashboardPage() {
                         <TranscriptDetails
                           messages={row.messages}
                           label={`View transcript & trace (${row.messages.length} turns)`}
-                          recordingUrl={row.recordingUrl}
-                          recordingAgentOnly={row.recordingAgentOnly}
                         />
                       </div>
                     ))}

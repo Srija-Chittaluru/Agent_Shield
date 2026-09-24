@@ -51,7 +51,6 @@ system already knows how to score as a system failure — no Judge change needed
 """
 import asyncio
 import json
-import time
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -118,52 +117,21 @@ def _create_call_body(agent: Any) -> dict:
     return body if isinstance(body, dict) else {}
 
 
-# How long, after an agent "turn" JSON event arrives, _drain_trailing_audio() keeps
-# reading the socket for that same turn's trailing TTS audio before giving up on it.
-# The target streams synthesized audio to the transport as it's generated, which can
-# lag behind the text-level turn decision (see the module docstring) — so some or
-# all of a turn's real audio frames may still be in flight when "turn" arrives.
-# Bounded on BOTH ends so this can never hang: stops at the first of the socket
-# going quiet for _POST_TURN_IDLE_S, or _POST_TURN_MAX_S total elapsed. Same
-# bounded-listen shape as app.core.twilio_bridge's own pattern (SILENCE_DURATION_S /
-# MAX_LISTEN_S).
-#
-# _POST_TURN_MAX_S was originally 3.0 as a defensive placeholder. A live,
-# frame-by-frame capture against the real Maya target showed that assumption was
-# wrong: audio streams in a smooth ~40ms cadence (inter-frame gaps never near
-# _POST_TURN_IDLE_S) for as long as the actual reply takes to speak — one observed
-# turn ran 11.84s of continuous audio, and the 3.0s cap was silently truncating it
-# to 2.6s. _POST_TURN_IDLE_S is what actually ends the drain promptly once Maya
-# stops talking; _POST_TURN_MAX_S only needs to be a safety ceiling comfortably
-# above realistic reply lengths, not a tight bound.
-_POST_TURN_IDLE_S = 0.5
-_POST_TURN_MAX_S = 20.0
-
-
 async def _next_agent_turn(ws: Any) -> Optional[dict]:
-    """Read frames until an agent-role "turn" event arrives, capturing any real
-    agent audio along the way.
+    """Read frames until an agent-role "turn" event arrives.
 
-    Skips the "caller" echo of the tester's own utterance, and "speaking"/
-    "interruption" frames. A binary frame is the agent's own real, already-
-    transmitted TTS audio — PCM16 mono 16kHz, no header (the target's own wire
-    format; see the module docstring) — captured rather than discarded, and
-    returned under "_audio_pcm16" on the "turn" payload once one is found (see
-    _drain_trailing_audio for why capture continues briefly past that point,
-    since more of this same turn's audio can still be arriving).
+    Skips the "caller" echo of the tester's own utterance, "speaking"/
+    "interruption" frames, and any binary frame (the target's own real TTS audio,
+    PCM16 mono 16kHz, no header — see the module docstring) — none of those are
+    the "turn" JSON event we're waiting for, so they're silently skipped rather
+    than breaking turn detection.
 
     Raises (propagates) if the socket closes or errors before a "turn" event is
-    ever seen — callers treat that exactly like any other transport failure, same
-    as before this function captured audio at all. A failure DURING the trailing-
-    audio drain does not propagate (see _drain_trailing_audio) — by then the
-    actual text reply has already arrived, so a dropped connection at that point
-    is not the turn failing, just its recording losing its tail.
+    ever seen — callers treat that exactly like any other transport failure.
     """
-    audio_chunks: list[bytes] = []
     while True:
         raw = await ws.recv()
         if not isinstance(raw, str):
-            audio_chunks.append(raw)
             continue
         try:
             payload = json.loads(raw)
@@ -172,38 +140,7 @@ async def _next_agent_turn(ws: Any) -> Optional[dict]:
         if not isinstance(payload, dict):
             continue
         if payload.get("type") == "turn" and payload.get("role") == "agent":
-            payload = dict(payload)
-            payload["_audio_pcm16"] = await _drain_trailing_audio(ws, audio_chunks)
             return payload
-
-
-async def _drain_trailing_audio(ws: Any, already: list[bytes]) -> bytes:
-    """Keep collecting binary PCM16 frames for a short, strictly bounded window
-    after an agent "turn" event, so audio still streaming out for that same turn
-    isn't cut off short. Never waits indefinitely — stops at the first of:
-      (a) the socket going quiet for _POST_TURN_IDLE_S,
-      (b) _POST_TURN_MAX_S total elapsed since this call started,
-      (c) a text frame arriving (whatever comes next isn't this turn's trailing
-          audio — e.g. a "speaking" event, or simply nothing else was sent, so
-          none is expected — silently absorbing an unrelated frame here would be
-          worse than stopping a little early), or
-      (d) the socket closing or erroring — returns whatever was captured so far
-          rather than raising, since the turn's actual text reply already arrived
-          by the time this runs.
-    """
-    deadline = time.monotonic() + _POST_TURN_MAX_S
-    while True:
-        remaining = min(_POST_TURN_IDLE_S, deadline - time.monotonic())
-        if remaining <= 0:
-            break
-        try:
-            raw = await asyncio.wait_for(ws.recv(), timeout=remaining)
-        except Exception:
-            break
-        if isinstance(raw, str):
-            break
-        already.append(raw)
-    return b"".join(already)
 
 
 async def _open_session(agent: Any, session: _Session) -> None:
@@ -305,18 +242,6 @@ async def _call_via_native_ws(
         trace["end_status"] = turn["end_status"]
     if turn.get("answers"):
         trace["answers"] = turn["answers"]
-
-    # Real agent audio for this turn (see _next_agent_turn/_drain_trailing_audio) —
-    # appended into the SAME conversation recording every other turn of this
-    # scenario shares (app.core.recording keys its buffer by session_key, i.e.
-    # conv_id), never a new recording per turn. Agent-only by construction: this
-    # protocol never produces caller audio, so append_pcm16() is the only append_*()
-    # call this transport ever makes — see FinalizedRecording.agent_only.
-    audio = turn.get("_audio_pcm16")
-    if session_key is not None and audio:
-        from app.core.recording import append_pcm16
-
-        append_pcm16(session_key, audio)
 
     return {"reply": reply, "trace": trace}
 

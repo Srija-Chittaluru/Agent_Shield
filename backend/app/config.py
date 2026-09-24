@@ -18,15 +18,6 @@ DATABASE_URL: str = os.getenv(
     "DATABASE_URL", "postgresql://localhost:5432/agentshield"
 )
 
-# --- Recordings ---------------------------------------------------------------
-# Where app.core.recording writes one WAV file per completed voice conversation,
-# reusing the real audio already produced/transmitted by the voice pipeline (see
-# that module's docstring for exactly what is and isn't captured per protocol).
-# Local disk only, no cloud storage — override via env for a different mount/volume.
-RECORDINGS_DIR: str = os.getenv(
-    "RECORDINGS_DIR", os.path.join(os.path.dirname(os.path.dirname(__file__)), "recordings")
-)
-
 # Demo safety: cap scenarios per run so a live run finishes well under ~90s.
 MAX_SCENARIOS: int = int(os.getenv("MAX_SCENARIOS", "10"))
 

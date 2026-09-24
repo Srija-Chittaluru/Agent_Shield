@@ -35,15 +35,6 @@ sentinel app.core.judge.AGENT_ERROR_SENTINEL ("<error>") that a transport failur
 already produces for a chat agent, so the existing judge._endpoint_never_responded() /
 _record_system_failure() machinery scores it exactly like an unreachable chat agent —
 no new failure category for the Judge to learn.
-
-Call recording (app.core.recording): http_json and websocket both hand their REAL,
-already-produced TTS/received audio to app.core.recording.append_wav() right where
-those bytes already exist below — no separate synthesis, no new audio ever generated
-just for this. twilio does the same with its real mu-law frames, in
-app.core.twilio_bridge.handle_media_stream(). native_ws records nothing (see
-app.core.recording's docstring for why that's a deliberate, documented limitation, not
-an oversight). close_voice_session() finalizes whatever was recorded, for every
-protocol, unconditionally.
 """
 import asyncio
 import base64
@@ -88,10 +79,10 @@ async def call_voice_agent(
     protocol = agent.get("voice_protocol") or "http_json"
 
     if protocol == "http_json":
-        return await _call_via_http_json(agent, message, history, faults, session_key=session_key)
+        return await _call_via_http_json(agent, message, history, faults)
 
     if protocol == "websocket":
-        return await _call_via_websocket(agent, message, history, faults, session_key=session_key)
+        return await _call_via_websocket(agent, message, history, faults)
 
     if protocol == "twilio":
         # Imported lazily (not at module top) so an environment with no Twilio
@@ -156,16 +147,6 @@ async def close_voice_session(agent: Any, session_key: Any) -> None:
     (Phase 3B) and native_ws's persistent call/socket both need it; it is the
     GUARANTEED cleanup path (a safety net for the case where no turn's
     `is_last_turn=True` ever actually fired — see runner.py's docstring).
-
-    Recording finalization (app.core.recording.finalize_recording) runs
-    unconditionally AFTER session teardown, for every protocol — it is a no-op
-    whenever nothing was ever recorded (a chat scenario, or a voice scenario that
-    failed before its first turn's audio existed), and this is the ONE guaranteed
-    place, success or failure, that a partial recording still gets written rather
-    than lost — same reasoning as session teardown itself. native_ws recordings are
-    agent-audio-only (see app.core.recording's docstring) — `finalized.agent_only`
-    carries that through to the DB unchanged for every other protocol, which always
-    represent both sides where recorded at all.
     """
     protocol = agent.get("voice_protocol") or "http_json"
     if protocol == "twilio":
@@ -177,35 +158,16 @@ async def close_voice_session(agent: Any, session_key: Any) -> None:
 
         await close_native_ws_session(session_key)
 
-    from app.core.recording import finalize_recording
-
-    finalized = finalize_recording(session_key)
-    # Only a real scenario run's session_key is a conversations.id to attach this to —
-    # /agents/{id}/probe uses a synthetic "probe:{agent_id}:{uuid}" string key (see
-    # routers/agents.py) that was never a conversation row, so there's nothing to update.
-    if finalized and isinstance(session_key, int):
-        from app.db import set_conversation_recording
-
-        set_conversation_recording(session_key, finalized.path, agent_only=finalized.agent_only)
-
 
 async def _call_via_http_json(
     agent: Any,
     message: str,
     history: Optional[list] = None,
     faults: Optional[list] = None,
-    session_key: Optional[Any] = None,
 ) -> dict:
     """The original (and, today, only implemented) voice transport: TTS the tester's
     text, POST it through the existing black-box HTTP adapter, STT the agent's spoken
     reply. Behavior is unchanged from before this module supported dispatch.
-
-    `session_key` (added for recording only — every other behavior here predates it)
-    is run_scenario()'s stable per-conversation id; when given, both real audio
-    bytes below — the TTS'd request actually sent, and the agent's own reply actually
-    received — are appended to that conversation's recording via app.core.recording.
-    None (the default) skips recording entirely without changing anything else, which
-    is also what happens if a direct caller (e.g. a test) never passes it.
     """
     # --- TTS: tester's text -> base64 WAV ------------------------------------
     try:
@@ -213,11 +175,6 @@ async def _call_via_http_json(
         audio_in_b64 = base64.b64encode(audio_in).decode("ascii")
     except Exception as e:
         return {"reply": AGENT_ERROR_SENTINEL, "trace": {"error": f"tts error: {e}"}}
-
-    if session_key is not None:
-        from app.core.recording import append_wav
-
-        append_wav(session_key, audio_in)
 
     # --- HTTP: reuse the existing black-box adapter, completely unchanged ----
     # This is what makes faults, auth headers, request templating, and system-fault
@@ -238,13 +195,6 @@ async def _call_via_http_json(
         audio_out = base64.b64decode(reply_b64) if reply_b64 else b""
         if not audio_out:
             raise ValueError("voice agent returned no audio")
-        if session_key is not None:
-            from app.core.recording import append_wav
-
-            # Recorded before STT so a real reply that happens to STT-fail (garbled
-            # audio, empty transcript) still keeps its actual audio in the recording —
-            # the recording documents what the agent SAID, not just what was legible.
-            append_wav(session_key, audio_out)
         transcript_out = await speech_to_text(audio_out)
         if not transcript_out:
             raise ValueError("STT produced an empty transcript")
@@ -290,7 +240,6 @@ async def _call_via_websocket(
     message: str,
     history: Optional[list] = None,
     faults: Optional[list] = None,
-    session_key: Optional[Any] = None,
 ) -> dict:
     """One voice turn over a fresh WebSocket connection (opened, used once, closed).
 
@@ -298,8 +247,6 @@ async def _call_via_websocket(
     agent's `auth_header` ("Header: value", the same convention adapter.send() already
     uses) is sent as a handshake header, since the WebSocket upgrade IS an HTTP
     request and carries arbitrary headers exactly like a normal one.
-
-    `session_key`: see _call_via_http_json's docstring — identical recording behavior.
     """
     url = (agent.get("endpoint_url") or "").strip()
     bad_url = _validate_ws_url(url)
@@ -312,11 +259,6 @@ async def _call_via_websocket(
         audio_in_b64 = base64.b64encode(audio_in).decode("ascii")
     except Exception as e:
         return {"reply": AGENT_ERROR_SENTINEL, "trace": {"error": f"tts error: {e}"}}
-
-    if session_key is not None:
-        from app.core.recording import append_wav
-
-        append_wav(session_key, audio_in)
 
     headers: dict[str, str] = {}
     if agent.get("auth_header"):
@@ -374,10 +316,6 @@ async def _call_via_websocket(
         audio_out = base64.b64decode(reply_b64)
         if not audio_out:
             raise ValueError("voice agent returned no audio")
-        if session_key is not None:
-            from app.core.recording import append_wav
-
-            append_wav(session_key, audio_out)
         transcript_out = await speech_to_text(audio_out)
         if not transcript_out:
             raise ValueError("STT produced an empty transcript")

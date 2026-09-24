@@ -88,17 +88,6 @@ export interface Conversation {
   suggested_fix?: string | null;
   evidence?: string | null;
   messages: Message[];
-  // Set for any voice conversation that has a real recording — http_json/websocket/
-  // Twilio (both sides) and native_ws (agent audio only, see recording_agent_only
-  // below). null for chat, and for a voice conversation that failed before any
-  // audio existed. GET this path for the WAV.
-  recording_url?: string | null;
-  // True iff recording_url, when present, contains ONLY the agent's audio —
-  // native_ws, which drives the caller via text (see
-  // backend/app/core/recording.py's docstring): there's no real caller audio to
-  // include. Always false for http_json/websocket/Twilio, which represent both
-  // sides whenever they have a recording at all.
-  recording_agent_only?: boolean;
 }
 
 export interface Performance {
@@ -438,16 +427,19 @@ export interface SavedNodeTest {
 
 // Save the reviewed goal+script as a real, persistent test case (existing test_cases
 // table) — a single addition, it never touches any other test case saved for this
-// agent. This is what makes the node test runnable afterward.
+// agent. This is what makes the node test runnable afterward. Pass `testId` (the id
+// from a prior save of this same node) to update that row in place instead of
+// inserting a duplicate — e.g. re-saving after an edit or a Run-triggered autosave.
 export function saveNodeTest(
   flowId: number,
   nodeId: string,
   testGoal: string,
-  script: NodeScriptTurn[]
+  script: NodeScriptTurn[],
+  testId?: number
 ): Promise<SavedNodeTest> {
   return req(`/flows/${flowId}/nodes/${encodeURIComponent(nodeId)}/test`, {
     method: "POST",
-    body: JSON.stringify({ test_goal: testGoal, script }),
+    body: JSON.stringify({ test_goal: testGoal, script, test_id: testId ?? null }),
   });
 }
 

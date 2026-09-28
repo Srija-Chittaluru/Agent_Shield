@@ -17,7 +17,6 @@ import {
   RotateCcw,
   Info,
   Mic,
-  MessageSquare,
   Save,
   PlayCircle,
   Trash2,
@@ -33,9 +32,6 @@ import {
   uploadAgentFlow,
   getAgentFlows,
   getFlow,
-  generateNodeScript,
-  saveNodeTest,
-  runNodeTest,
   getRun,
   getReport,
   previewFlowScenarios,
@@ -53,22 +49,17 @@ import {
   InventoryAgent,
   FlowSummary,
   FlowDetail,
-  NodeScriptTurn,
-  SavedNodeTest,
   Report,
 } from "../lib/api";
 import { TranscriptDetails } from "../dashboard/page";
 
-// Phase 1: upload -> parse -> store -> display nodes.
-// Phase 2: select a node -> generate a test goal + a deterministic caller script ->
-// review/edit it.
-// Phase 3 (this file also covers it): save the reviewed script as a real test case,
-// then run it through the EXISTING Temporal execution pipeline — the same
+// Upload -> parse -> store -> show the flow's structure, then plan its scenarios
+// (normal paths + interrupts), generate/edit/save each one's deterministic caller
+// script, and run it through the EXISTING Temporal execution pipeline — the same
 // AgentTestWorkflow/RunGroupWorkflow, scripted runner, voice protocols, and Judge
 // every other test uses (see backend/app/routers/flows.py and
-// app/core/node_script.py). This introduces no second voice-testing engine. Results
-// are shown here by reusing the dashboard's own transcript view (TranscriptDetails,
-// imported from ../dashboard/page) rather than duplicating it.
+// app/core/node_script.py). Results reuse the dashboard's own transcript view
+// (TranscriptDetails, imported from ../dashboard/page) rather than duplicating it.
 
 // One scenario's script in the UI. `saved`: a copy exists server-side. `dirty`: the
 // local copy differs from it (always true for a never-saved draft).
@@ -158,7 +149,6 @@ export default function FlowsPage() {
   const [showUpload, setShowUpload] = useState(false);
   // Edges start collapsed — a large flow's edge list is long and rarely needed at a
   // glance. Purely a display toggle; the parsed edge data itself is untouched.
-  const [edgesExpanded, setEdgesExpanded] = useState(false);
 
   // Flow-level scenario preview — read-only planning output for the loaded flow.
   const [scenarioPreview, setScenarioPreview] = useState<FlowScenarioPreview | null>(null);
@@ -179,38 +169,6 @@ export default function FlowsPage() {
   const [expandedInterruptId, setExpandedInterruptId] = useState<string | null>(null);
   // Test data for the flow's user.* record fields, used verbatim by interrupt scripts.
   const [recordText, setRecordText] = useState("");
-
-  // Phase 2 — selected node + its generated/edited test goal & script (draft only,
-  // nothing here is persisted).
-  const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
-  const [testGoal, setTestGoal] = useState("");
-  const [script, setScript] = useState<NodeScriptTurn[] | null>(null);
-  const [generating, setGenerating] = useState(false);
-  const [genErrors, setGenErrors] = useState<string[] | null>(null);
-  // `dirty` tracks whether the current draft differs from whatever was last saved,
-  // so Save/Run know whether a (re)save is needed and, when it is, whether to insert
-  // a new test case or update the one already saved for this node.
-  const [dirty, setDirty] = useState(false);
-  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
-
-  // Brings the Node Test section into view the moment a node is selected, instead of
-  // requiring a manual scroll past the node list — never fires on initial page load
-  // since selectedNodeId starts null and only changes via an explicit node click.
-  const nodeTestRef = useRef<HTMLDivElement | null>(null);
-
-  // Phase 3 — save the reviewed script, then run it through the existing pipeline.
-  const [savedTest, setSavedTest] = useState<SavedNodeTest | null>(null);
-  const [saving, setSaving] = useState(false);
-  const [saveErrors, setSaveErrors] = useState<string[] | null>(null);
-  const [runId, setRunId] = useState<number | null>(null);
-  const [runStatus, setRunStatus] = useState<string | null>(null);
-  const [running, setRunning] = useState(false);
-  const [runErrors, setRunErrors] = useState<string[] | null>(null);
-  const [report, setReport] = useState<Report | null>(null);
-
-  useEffect(() => {
-    if (selectedNodeId) nodeTestRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
-  }, [selectedNodeId]);
 
   const flowId = flow?.id ?? null;
   const loadedFlowIdRef = useRef<number | null>(null);
@@ -405,7 +363,7 @@ export default function FlowsPage() {
   }
 
   // Deletes the SAVED scenario row (if any) and clears the card back to its path. The
-  // flow, its nodes/edges, node tests, test cases and runs are never touched.
+  // flow, its nodes/edges, test cases and runs are never touched.
   async function onDeleteFlowScript(id: string) {
     const work = flowScripts[id];
     if (flowId == null || !work) return;
@@ -446,7 +404,7 @@ export default function FlowsPage() {
   }
 
   // Run a SAVED scenario's SAVED script, then poll the EXISTING run/report endpoints —
-  // the same ones the node test (and the dashboard) poll — until it finishes.
+  // the same ones the dashboard polls — until it finishes.
   async function onRunFlowScenario(id: string) {
     const work = flowScripts[id];
     if (flowId == null || !work?.saved || work.dirty) return;
@@ -597,172 +555,6 @@ export default function FlowsPage() {
   function nodeName(id: string): string {
     return flow?.nodes.find((n) => n.id === id)?.name ?? id;
   }
-
-  const selectedNode = useMemo(
-    () => flow?.nodes.find((n) => n.id === selectedNodeId) ?? null,
-    [flow, selectedNodeId]
-  );
-
-  // Explicit script state (see the pasted UX spec's "SCRIPT STATE" section): drives
-  // which helper text/badge shows without adding a separate state-management layer —
-  // it's derived from the existing script/savedTest/dirty pieces above.
-  type ScriptStatus = "none" | "draft" | "saved" | "modified";
-  const scriptStatus: ScriptStatus = !script ? "none" : !savedTest ? "draft" : dirty ? "modified" : "saved";
-
-  function resetSaveAndRunState() {
-    setSavedTest(null);
-    setSaveErrors(null);
-    setRunId(null);
-    setRunStatus(null);
-    setRunning(false);
-    setRunErrors(null);
-    setReport(null);
-    setDirty(false);
-    setShowDeleteConfirm(false);
-  }
-
-  function selectNode(nodeId: string) {
-    if (nodeId === selectedNodeId) return;
-    setSelectedNodeId(nodeId);
-    setTestGoal("");
-    setScript(null);
-    setGenErrors(null);
-    resetSaveAndRunState();
-  }
-
-  async function onGenerateScript() {
-    if (!flow || !selectedNodeId) return;
-    setGenerating(true);
-    setGenErrors(null);
-    resetSaveAndRunState(); // a (re)generated script is unreviewed and unsaved again
-    try {
-      const result = await generateNodeScript(flow.id, selectedNodeId, testGoal.trim() || undefined);
-      setTestGoal(result.test_goal);
-      setScript(result.script);
-    } catch (err) {
-      setGenErrors(extractErrors(err instanceof Error ? err.message : String(err)));
-    } finally {
-      setGenerating(false);
-    }
-  }
-
-  function updateTurn(index: number, field: keyof NodeScriptTurn, value: string) {
-    setScript((prev) => {
-      if (!prev) return prev;
-      const next = [...prev];
-      next[index] = { ...next[index], [field]: value };
-      return next;
-    });
-    setDirty(true); // no-op while there's nothing saved yet (scriptStatus ignores it until then)
-  }
-
-  function onTestGoalChange(value: string) {
-    setTestGoal(value);
-    setDirty(true);
-  }
-
-  function onDeleteDraft() {
-    setScript(null);
-    setGenErrors(null);
-    resetSaveAndRunState(); // clears the local draft/save link only — the persisted
-    // test_cases row (if any) is left untouched, per the "never silently delete a
-    // saved test case" requirement.
-  }
-
-  // Shared by Save and the Run auto-save path — persists the current draft, updating
-  // the row from a prior save of THIS node instead of inserting a duplicate.
-  async function persistScript(): Promise<SavedNodeTest> {
-    if (!flow || !selectedNodeId || !script || !testGoal.trim()) {
-      throw new Error("Generate a script and enter a test goal before saving.");
-    }
-    const result = await saveNodeTest(flow.id, selectedNodeId, testGoal.trim(), script, savedTest?.test_id);
-    setSavedTest(result);
-    setDirty(false);
-    return result;
-  }
-
-  async function onSaveTest() {
-    if (!script || !testGoal.trim()) return;
-    setSaving(true);
-    setSaveErrors(null);
-    setRunId(null);
-    setRunStatus(null);
-    setReport(null);
-    setRunErrors(null);
-    try {
-      await persistScript();
-    } catch (err) {
-      setSaveErrors(extractErrors(err instanceof Error ? err.message : String(err)));
-    } finally {
-      setSaving(false);
-    }
-  }
-
-  // RUN: save first only if there's nothing saved yet, or the draft has changed since
-  // the last save — otherwise reuse the existing saved test id as-is. Either way, the
-  // existing save/run APIs are the only path; there's no second execution route.
-  async function onRunTest() {
-    if (!flow || !selectedNodeId || !script || !testGoal.trim()) return;
-    setRunning(true);
-    setRunErrors(null);
-    setReport(null);
-    try {
-      let testId = savedTest?.test_id ?? null;
-      if (!savedTest || dirty) {
-        setSaving(true);
-        const saved = await persistScript();
-        testId = saved.test_id;
-        setSaving(false);
-      }
-      const result = await runNodeTest(flow.id, selectedNodeId, testId as number);
-      setRunStatus("queued");
-      setRunId(result.run_id);
-    } catch (err) {
-      setRunErrors(extractErrors(err instanceof Error ? err.message : String(err)));
-      setRunning(false);
-      setSaving(false);
-    }
-  }
-
-  // Poll the EXISTING run/report endpoints (same ones the dashboard already polls)
-  // until the run finishes, then load its full report.
-  useEffect(() => {
-    if (runId == null) return;
-    let cancelled = false;
-
-    const poll = async () => {
-      try {
-        const status = await getRun(runId);
-        if (cancelled) return;
-        setRunStatus(status.status);
-        if (status.status === "done" || status.status === "error") {
-          const rep = await getReport(runId);
-          if (!cancelled) {
-            setReport(rep);
-            setRunning(false);
-          }
-          return true; // stop polling
-        }
-      } catch (err) {
-        if (!cancelled) {
-          setRunErrors(extractErrors(err instanceof Error ? err.message : String(err)));
-          setRunning(false);
-        }
-        return true;
-      }
-      return false;
-    };
-
-    const interval = setInterval(async () => {
-      if (await poll()) clearInterval(interval);
-    }, 2000);
-    poll(); // check immediately rather than waiting a full interval
-
-    return () => {
-      cancelled = true;
-      clearInterval(interval);
-    };
-  }, [runId]);
 
   return (
     <main className="min-h-screen bg-[#0B0B0F] pb-24 text-[#F8FAFC]">
@@ -963,106 +755,9 @@ export default function FlowsPage() {
           )}
         </div>
 
-        {/* Step 3: parsed nodes/edges */}
+        {/* Step 3: parsed nodes/edges — a summary, with the details behind a toggle */}
         {flow && (
-          <div className="mt-6 rounded-xl border border-white/12 bg-white/2 p-6">
-            <label className="block text-sm font-medium text-[#F8FAFC]">3. Detected nodes</label>
-            {flow.extraction_method && (
-              <p className="mt-1 text-xs text-[#9CA3AF]">
-                Parsed using{" "}
-                {flow.extraction_method === "llm" ? "LLM-assisted extraction" : "deterministic extraction"}
-              </p>
-            )}
-
-            <div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-2">
-              {flow.nodes.map((n) => {
-                const isSelected = selectedNodeId === n.id;
-                return (
-                  <button
-                    key={n.id}
-                    onClick={() => selectNode(n.id)}
-                    className={`rounded-lg border p-4 text-left transition ${
-                      isSelected
-                        ? "border-white/50 bg-white/10"
-                        : "border-white/12 bg-black/30 hover:border-white/25 hover:bg-white/5"
-                    }`}
-                  >
-                    <div className="flex items-center justify-between gap-2">
-                      <div className="flex min-w-0 items-center gap-1.5">
-                        {isSelected ? (
-                          <ChevronDown className="h-3.5 w-3.5 shrink-0 text-[#9CA3AF]" strokeWidth={1.5} />
-                        ) : (
-                          <ChevronRight className="h-3.5 w-3.5 shrink-0 text-[#9CA3AF]" strokeWidth={1.5} />
-                        )}
-                        <h3 className="truncate font-medium text-[#F8FAFC]">{n.name}</h3>
-                      </div>
-                      {n.type && (
-                        <span className="shrink-0 rounded-full border border-white/15 px-2 py-0.5 text-[10px] uppercase tracking-wide text-[#9CA3AF]">
-                          {n.type}
-                        </span>
-                      )}
-                    </div>
-                    <p className="mt-1 pl-5 text-xs text-[#9CA3AF]">
-                      id: {n.id}
-                      {n.source_path && <span className="text-slate-600"> · {n.source_path}</span>}
-                    </p>
-                    {isSelected && (
-                      <div className="pl-5">
-                        {n.purpose && <p className="mt-2 text-sm text-[#D1D5DB]">{n.purpose}</p>}
-                        {n.expected_inputs.length > 0 && (
-                          <div className="mt-3 flex flex-wrap gap-1.5">
-                            {n.expected_inputs.map((inp) => (
-                              <span
-                                key={inp}
-                                className="rounded-md border border-white/10 bg-white/5 px-1.5 py-0.5 text-[11px] text-[#9CA3AF]"
-                              >
-                                {inp}
-                              </span>
-                            ))}
-                          </div>
-                        )}
-                        <div className="mt-3 flex items-center gap-1.5 text-xs text-[#9CA3AF]">
-                          <Target className="h-3.5 w-3.5" strokeWidth={1.5} />
-                          Selected for testing
-                        </div>
-                      </div>
-                    )}
-                  </button>
-                );
-              })}
-            </div>
-
-            {flow.edges.length === 0 ? (
-              <>
-                <label className="mt-6 block text-sm font-medium text-[#F8FAFC]">Edges</label>
-                <p className="mt-2 text-sm text-[#9CA3AF]">This flow has no edges.</p>
-              </>
-            ) : (
-              <button
-                onClick={() => setEdgesExpanded((e) => !e)}
-                className="mt-6 flex w-full items-center gap-1.5 text-sm font-medium text-[#F8FAFC] transition hover:text-white"
-              >
-                {edgesExpanded ? (
-                  <ChevronDown className="h-3.5 w-3.5 shrink-0 text-[#9CA3AF]" strokeWidth={1.5} />
-                ) : (
-                  <ChevronRight className="h-3.5 w-3.5 shrink-0 text-[#9CA3AF]" strokeWidth={1.5} />
-                )}
-                Edges ({flow.edges.length})
-              </button>
-            )}
-            {edgesExpanded && flow.edges.length > 0 && (
-              <ul className="mt-2 space-y-1.5 pl-5">
-                {flow.edges.map((e, i) => (
-                  <li key={i} className="flex items-center gap-2 text-sm text-[#D1D5DB]">
-                    <FileCode2 className="h-3.5 w-3.5 shrink-0 text-[#9CA3AF]" strokeWidth={1.5} />
-                    {nodeName(e.from)}
-                    <ArrowRight className="h-3.5 w-3.5 shrink-0 text-[#9CA3AF]" strokeWidth={1.5} />
-                    {nodeName(e.to)}
-                  </li>
-                ))}
-              </ul>
-            )}
-          </div>
+          <FlowStructure key={flow.id} flow={flow} nodeName={nodeName} />
         )}
 
         {/* Possible test scenarios — read-only preview of the backend planner's
@@ -1353,301 +1048,187 @@ export default function FlowsPage() {
           </div>
         )}
 
-        {/* Step 4: selected node -> test goal -> deterministic script (Phase 2) */}
-        {selectedNode && (
-          <div ref={nodeTestRef} className="mt-6 scroll-mt-24 rounded-xl border border-white/12 bg-white/2 p-6">
-            <label className="block text-sm font-medium text-[#F8FAFC]">5. Node test</label>
-
-            <div className="mt-3 rounded-lg border border-white/10 bg-black/30 p-4">
-              <p className="text-[10px] font-medium uppercase tracking-wide text-[#9CA3AF]">Selected node</p>
-              <div className="mt-1.5 flex items-center gap-2">
-                <Target className="h-4 w-4 text-[#9CA3AF]" strokeWidth={1.5} />
-                <h3 className="font-medium text-[#F8FAFC]">{selectedNode.name}</h3>
-                <span className="text-xs text-[#9CA3AF]">({selectedNode.id})</span>
-              </div>
-              {selectedNode.purpose && (
-                <p className="mt-2 text-sm text-[#D1D5DB]">{selectedNode.purpose}</p>
-              )}
-            </div>
-
-            <label className="mt-5 block text-sm font-medium text-[#F8FAFC]">Test goal</label>
-            <p className="mt-1 text-xs text-[#9CA3AF]">
-              Describe what this test should verify, or leave it blank and let generation infer
-              one from the node&apos;s purpose.
-            </p>
-            <textarea
-              value={testGoal}
-              onChange={(e) => onTestGoalChange(e.target.value)}
-              placeholder="e.g. Verify the agent rejects an incorrect name before accepting the correct one."
-              rows={2}
-              className="mt-2 w-full resize-y rounded-lg border border-white/15 bg-black/40 px-3 py-2 text-sm text-[#F8FAFC] outline-none focus:border-white/40"
-            />
-
-            {!script && (
-              <button
-                onClick={onGenerateScript}
-                disabled={generating}
-                className="mt-3 inline-flex items-center gap-2 rounded-lg border border-white/20 bg-white/8 px-4 py-2 text-sm font-medium text-[#F8FAFC] transition hover:bg-white/15 disabled:opacity-50"
-              >
-                {generating ? (
-                  <Loader2 className="h-4 w-4 animate-spin" strokeWidth={1.5} />
-                ) : (
-                  <Wand2 className="h-4 w-4" strokeWidth={1.5} />
-                )}
-                {generating ? "Generating…" : "Generate Test Script"}
-              </button>
-            )}
-
-            {genErrors && (
-              <div className="mt-3 rounded-lg border border-rose-400/30 bg-rose-400/10 px-3 py-2 text-sm text-rose-300">
-                <div className="flex items-center gap-2 font-medium">
-                  <AlertTriangle className="h-4 w-4 shrink-0" strokeWidth={1.5} />
-                  Could not generate a valid script
-                </div>
-                <ul className="mt-1.5 list-disc space-y-0.5 pl-6">
-                  {genErrors.map((e, i) => (
-                    <li key={i}>{e}</li>
-                  ))}
-                </ul>
-              </div>
-            )}
-
-            {script && (
-              <div className="mt-6">
-                <div className="flex flex-wrap items-center justify-between gap-2">
-                  <label className="block text-sm font-medium text-[#F8FAFC]">Generated test script</label>
-                  {scriptStatus === "saved" && (
-                    <span className="rounded-full border border-emerald-400/30 bg-emerald-400/10 px-2.5 py-0.5 text-[11px] font-medium text-emerald-300">
-                      Saved as test #{savedTest?.test_id}
-                    </span>
-                  )}
-                  {scriptStatus === "modified" && (
-                    <span className="rounded-full border border-amber-400/30 bg-amber-400/10 px-2.5 py-0.5 text-[11px] font-medium text-amber-300">
-                      Unsaved changes
-                    </span>
-                  )}
-                  {scriptStatus === "draft" && (
-                    <span className="rounded-full border border-white/15 px-2.5 py-0.5 text-[11px] font-medium text-[#9CA3AF]">
-                      Draft — not saved yet
-                    </span>
-                  )}
-                </div>
-
-                <div className="mt-2 flex items-start gap-2 rounded-lg border border-sky-400/25 bg-sky-400/10 px-3 py-2 text-xs text-sky-200">
-                  <Info className="mt-0.5 h-3.5 w-3.5 shrink-0" strokeWidth={1.5} />
-                  Caller lines are executed exactly as written during the test. The Voice
-                  Agent&apos;s actual responses are not scripted — they are captured live and
-                  checked against &quot;Expected Agent Behavior&quot; when this test runs.
-                </div>
-
-                <div className="mt-4 space-y-4">
-                  {script.map((turn, i) => (
-                    <div key={i} className="rounded-lg border border-white/12 bg-black/30 p-4">
-                      <p className="text-xs font-medium uppercase tracking-wide text-[#9CA3AF]">
-                        Turn {i + 1}
-                      </p>
-
-                      <div className="mt-3">
-                        <label className="flex items-center gap-1.5 text-xs font-medium text-amber-300">
-                          <ShieldCheck className="h-3.5 w-3.5" strokeWidth={1.5} />
-                          Expected Agent Behavior (evaluation only — never spoken)
-                        </label>
-                        <textarea
-                          value={turn.expected_agent_behavior}
-                          onChange={(e) => updateTurn(i, "expected_agent_behavior", e.target.value)}
-                          rows={2}
-                          className="mt-1.5 w-full resize-y rounded-lg border border-amber-400/20 bg-amber-400/5 px-3 py-2 text-sm text-[#F8FAFC] outline-none focus:border-amber-400/50"
-                        />
-                      </div>
-
-                      <div className="mt-3">
-                        <label className="flex items-center gap-1.5 text-xs font-medium text-emerald-300">
-                          <Mic className="h-3.5 w-3.5" strokeWidth={1.5} />
-                          Caller (spoken verbatim during the test)
-                        </label>
-                        <textarea
-                          value={turn.caller_line}
-                          onChange={(e) => updateTurn(i, "caller_line", e.target.value)}
-                          rows={2}
-                          className="mt-1.5 w-full resize-y rounded-lg border border-emerald-400/20 bg-emerald-400/5 px-3 py-2 text-sm text-[#F8FAFC] outline-none focus:border-emerald-400/50"
-                        />
-                      </div>
-                    </div>
-                  ))}
-                </div>
-
-                <p className="mt-4 flex items-center gap-1.5 text-xs text-[#9CA3AF]">
-                  <MessageSquare className="h-3.5 w-3.5" strokeWidth={1.5} />
-                  Caller lines are executed exactly as written during the test&#8202;— edit
-                  them directly above, then save and run against the Voice Agent.
-                </p>
-
-                {/* Compact secondary actions: Regenerate / Delete. */}
-                <div className="mt-4 flex flex-wrap items-center gap-2">
-                  <button
-                    onClick={onGenerateScript}
-                    disabled={generating}
-                    className="inline-flex items-center gap-1.5 rounded-full border border-white/15 px-3 py-1.5 text-xs font-medium text-[#9CA3AF] transition hover:border-white/30 hover:text-white disabled:opacity-50"
-                  >
-                    {generating ? (
-                      <Loader2 className="h-3.5 w-3.5 animate-spin" strokeWidth={1.5} />
-                    ) : (
-                      <RotateCcw className="h-3.5 w-3.5" strokeWidth={1.5} />
-                    )}
-                    {generating ? "Regenerating…" : "Regenerate"}
-                  </button>
-                  <button
-                    onClick={() => setShowDeleteConfirm(true)}
-                    className="inline-flex items-center gap-1.5 rounded-full border border-rose-400/25 px-3 py-1.5 text-xs font-medium text-rose-300 transition hover:border-rose-400/50 hover:bg-rose-400/10"
-                  >
-                    <Trash2 className="h-3.5 w-3.5" strokeWidth={1.5} />
-                    Delete
-                  </button>
-                </div>
-
-                {showDeleteConfirm && (
-                  <div className="mt-3 rounded-lg border border-rose-400/30 bg-rose-400/10 px-3 py-3 text-sm text-rose-200">
-                    <p>
-                      {savedTest
-                        ? `This clears the draft here in the workspace. Saved test #${savedTest.test_id} stays stored and can still be run or found elsewhere — it will not be deleted.`
-                        : "Discard this generated draft? It hasn't been saved anywhere."}
-                    </p>
-                    <div className="mt-2 flex gap-2">
-                      <button
-                        onClick={() => {
-                          onDeleteDraft();
-                        }}
-                        className="rounded-full border border-rose-400/40 px-3 py-1 text-xs font-medium text-rose-200 transition hover:bg-rose-400/20"
-                      >
-                        Clear Draft
-                      </button>
-                      <button
-                        onClick={() => setShowDeleteConfirm(false)}
-                        className="rounded-full border border-white/15 px-3 py-1 text-xs text-[#9CA3AF] transition hover:border-white/30 hover:text-white"
-                      >
-                        Cancel
-                      </button>
-                    </div>
-                  </div>
-                )}
-
-                {/* Primary actions: Save + Run are both visible as soon as a draft exists. */}
-                <div className="mt-5 flex flex-wrap items-center gap-3">
-                  <button
-                    onClick={onSaveTest}
-                    disabled={saving || !testGoal.trim()}
-                    className="inline-flex items-center gap-2 rounded-lg border border-white/20 bg-white/8 px-4 py-2 text-sm font-medium text-[#F8FAFC] transition hover:bg-white/15 disabled:opacity-50"
-                  >
-                    {saving ? (
-                      <Loader2 className="h-4 w-4 animate-spin" strokeWidth={1.5} />
-                    ) : (
-                      <Save className="h-4 w-4" strokeWidth={1.5} />
-                    )}
-                    {saving ? "Saving…" : "Save Test"}
-                  </button>
-                  <button
-                    onClick={onRunTest}
-                    disabled={running || !testGoal.trim()}
-                    className="inline-flex items-center gap-2 rounded-lg border border-emerald-400/40 bg-emerald-400/15 px-4 py-2 text-sm font-medium text-emerald-200 transition hover:bg-emerald-400/25 disabled:opacity-50"
-                  >
-                    {running ? (
-                      <Loader2 className="h-4 w-4 animate-spin" strokeWidth={1.5} />
-                    ) : (
-                      <PlayCircle className="h-4 w-4" strokeWidth={1.5} />
-                    )}
-                    {running ? "Running…" : "Run Test"}
-                  </button>
-                </div>
-                <p className="mt-2 text-xs text-[#9CA3AF]">
-                  Run Test automatically saves changes before starting.
-                </p>
-
-                {saveErrors && (
-                  <div className="mt-3 rounded-lg border border-rose-400/30 bg-rose-400/10 px-3 py-2 text-sm text-rose-300">
-                    <div className="flex items-center gap-2 font-medium">
-                      <AlertTriangle className="h-4 w-4 shrink-0" strokeWidth={1.5} />
-                      Could not save this test
-                    </div>
-                    <ul className="mt-1.5 list-disc space-y-0.5 pl-6">
-                      {saveErrors.map((e, i) => (
-                        <li key={i}>{e}</li>
-                      ))}
-                    </ul>
-                  </div>
-                )}
-
-                {runErrors && (
-                  <div className="mt-3 rounded-lg border border-rose-400/30 bg-rose-400/10 px-3 py-2 text-sm text-rose-300">
-                    <div className="flex items-center gap-2 font-medium">
-                      <AlertTriangle className="h-4 w-4 shrink-0" strokeWidth={1.5} />
-                      Could not run this test
-                    </div>
-                    <ul className="mt-1.5 list-disc space-y-0.5 pl-6">
-                      {runErrors.map((e, i) => (
-                        <li key={i}>{e}</li>
-                      ))}
-                    </ul>
-                  </div>
-                )}
-
-                {running && !report && (
-                  <div className="mt-4 flex items-center gap-2 text-sm text-[#9CA3AF]">
-                    <Loader2 className="h-4 w-4 animate-spin" strokeWidth={1.5} />
-                    {runStatus === "queued" || runStatus === "running"
-                      ? "Running against the Voice Agent through AgentShield's existing voice pipeline…"
-                      : "Starting…"}
-                  </div>
-                )}
-
-                {/* Result — reuses the dashboard's own transcript view. */}
-                {report && report.conversations[0] && (
-                  <div className="mt-6 rounded-lg border border-white/12 bg-black/30 p-4">
-                    <div className="flex items-center justify-between gap-2">
-                      <h4 className="font-medium text-[#F8FAFC]">Result</h4>
-                      <span
-                        className={`rounded-full border px-2.5 py-0.5 text-xs font-medium uppercase tracking-wide ${
-                          report.conversations[0].verdict === "pass"
-                            ? "border-emerald-400/40 text-emerald-300"
-                            : "border-rose-400/40 text-rose-300"
-                        }`}
-                      >
-                        {report.conversations[0].verdict ?? "unjudged"}
-                        {report.conversations[0].severity ? ` · ${report.conversations[0].severity}` : ""}
-                      </span>
-                    </div>
-                    {typeof report.reliability_score === "number" && (
-                      <p className="mt-1 text-xs text-[#9CA3AF]">
-                        Reliability score: {report.reliability_score}
-                      </p>
-                    )}
-                    {report.conversations[0].explanation && (
-                      <p className="mt-3 text-sm text-[#D1D5DB]">
-                        <span className="font-medium text-[#F8FAFC]">Why: </span>
-                        {report.conversations[0].explanation}
-                      </p>
-                    )}
-                    {report.conversations[0].suggested_fix && (
-                      <p className="mt-2 text-sm text-[#D1D5DB]">
-                        <span className="font-medium text-[#F8FAFC]">Suggested fix: </span>
-                        {report.conversations[0].suggested_fix}
-                      </p>
-                    )}
-                    <TranscriptDetails
-                      messages={report.conversations[0].messages}
-                      label="Transcript"
-                    />
-                  </div>
-                )}
-              </div>
-            )}
-          </div>
-        )}
       </section>
     </main>
   );
 }
 
 const OUTCOME_LABELS: Record<string, string> = { goto: "Goto", end: "End", resume: "Resume" };
+
+// Readable lines from a node's `purpose`. A modular flow step's purpose is its prompt
+// block as stored by the parser (e.g. "{'en-US': {'ask': {'text': '...'}, ...}}"); the
+// spoken text / intent of each part is pulled out of it. Any other purpose is plain
+// text and shown as is.
+const PROMPT_PART_LABELS: Record<string, string> = {
+  say: "Says",
+  ask: "Asks",
+  reask: "Asks again",
+  clarify: "If the caller asks something else",
+  readback: "Reads back",
+  confirm: "Confirms",
+  declined: "If the caller declines",
+  invite: "Invites",
+};
+
+function purposeLines(purpose: string): { label: string; text: string }[] {
+  const text = (purpose || "").trim();
+  if (!text) return [];
+  if (!text.startsWith("{")) return [{ label: "Purpose", text }];
+  const part = /'(\w+)':\s*\{\s*'(text|intent)':\s*(?:'((?:[^'\\]|\\.)*)'|"((?:[^"\\]|\\.)*)")/g;
+  const lines: { label: string; text: string }[] = [];
+  let m: RegExpExecArray | null;
+  while ((m = part.exec(text)) !== null) {
+    const spoken = (m[3] ?? m[4] ?? "").replace(/\\'/g, "'").replace(/\\"/g, '"');
+    const base = PROMPT_PART_LABELS[m[1]] ?? m[1];
+    lines.push({ label: m[2] === "intent" ? `${base} (in its own words)` : base, text: spoken });
+  }
+  return lines.length ? lines : [{ label: "Details", text }];
+}
+
+function FlowStructure({ flow, nodeName }: { flow: FlowDetail; nodeName: (id: string) => string }) {
+  const [open, setOpen] = useState(false);
+  const [typeFilter, setTypeFilter] = useState<string | null>(null);
+  const [expandedId, setExpandedId] = useState<string | null>(null);
+  const [edgesOpen, setEdgesOpen] = useState(false);
+
+  const typeCounts = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const n of flow.nodes) if (n.type) counts.set(n.type, (counts.get(n.type) ?? 0) + 1);
+    return [...counts.entries()];
+  }, [flow.nodes]);
+  const shown = typeFilter ? flow.nodes.filter((n) => n.type === typeFilter) : flow.nodes;
+
+  const chip = (active: boolean) =>
+    `rounded-full border px-2.5 py-1 text-xs transition ${
+      active ? "border-white/40 bg-white/10 text-[#F8FAFC]" : "border-white/12 text-[#9CA3AF] hover:border-white/25 hover:text-[#D1D5DB]"
+    }`;
+
+  return (
+    <div className="mt-6 rounded-xl border border-white/12 bg-white/2 p-6">
+      <label className="block text-sm font-medium text-[#F8FAFC]">3. Flow structure</label>
+      <p className="mt-1 text-xs text-[#9CA3AF]">
+        {flow.nodes.length} nodes · {flow.edges.length} edges
+        {flow.extraction_method && (
+          <> · parsed using {flow.extraction_method === "llm" ? "LLM-assisted extraction" : "deterministic extraction"}</>
+        )}
+      </p>
+      {typeCounts.length > 0 && (
+        <p className="mt-1 text-xs text-[#9CA3AF]">
+          {typeCounts.map(([t, c]) => `${c} ${t}`).join(" · ")}
+        </p>
+      )}
+
+      <button
+        onClick={() => setOpen((o) => !o)}
+        className="mt-3 inline-flex items-center gap-2 rounded-lg border border-white/20 bg-white/8 px-4 py-2 text-sm font-medium text-[#F8FAFC] transition hover:bg-white/15"
+      >
+        {open ? <ChevronDown className="h-4 w-4" strokeWidth={1.5} /> : <ChevronRight className="h-4 w-4" strokeWidth={1.5} />}
+        {open ? "Hide node details" : "View node details"}
+      </button>
+
+      {open && (
+        <div className="mt-4">
+          {typeCounts.length > 1 && (
+            <div className="flex flex-wrap gap-1.5">
+              <button onClick={() => setTypeFilter(null)} className={chip(typeFilter === null)}>
+                All ({flow.nodes.length})
+              </button>
+              {typeCounts.map(([t, c]) => (
+                <button key={t} onClick={() => setTypeFilter(t)} className={chip(typeFilter === t)}>
+                  {t} ({c})
+                </button>
+              ))}
+            </div>
+          )}
+
+          <ul className="mt-3 divide-y divide-white/8 overflow-hidden rounded-lg border border-white/10">
+            {shown.map((n) => {
+              const expanded = expandedId === n.id;
+              const lines = purposeLines(n.purpose);
+              return (
+                <li key={n.id} className="bg-black/20">
+                  <button
+                    onClick={() => setExpandedId((cur) => (cur === n.id ? null : n.id))}
+                    className="flex w-full items-center gap-2 px-3 py-2 text-left transition hover:bg-white/5"
+                  >
+                    {expanded ? (
+                      <ChevronDown className="h-3.5 w-3.5 shrink-0 text-[#9CA3AF]" strokeWidth={1.5} />
+                    ) : (
+                      <ChevronRight className="h-3.5 w-3.5 shrink-0 text-[#9CA3AF]" strokeWidth={1.5} />
+                    )}
+                    <span className="truncate text-sm text-[#F8FAFC]">{n.name}</span>
+                    {n.name !== n.id && <span className="truncate text-xs text-[#9CA3AF]">{n.id}</span>}
+                    {n.type && (
+                      <span className="ml-auto shrink-0 rounded-full border border-white/15 px-2 py-0.5 text-[10px] uppercase tracking-wide text-[#9CA3AF]">
+                        {n.type}
+                      </span>
+                    )}
+                  </button>
+                  {expanded && (
+                    <div className="space-y-2 px-3 pb-3 pl-8">
+                      {lines.length === 0 ? (
+                        <p className="text-xs text-[#9CA3AF]">
+                          {n.type === "branch" ? "Routes the call to the next step — the agent says nothing here." : "No details in the flow."}
+                        </p>
+                      ) : (
+                        lines.map((l, i) => (
+                          <div key={i}>
+                            <p className="text-[11px] font-medium uppercase tracking-wide text-[#9CA3AF]">{l.label}</p>
+                            <p className="text-sm text-[#D1D5DB]">{l.text}</p>
+                          </div>
+                        ))
+                      )}
+                      {n.expected_inputs.length > 0 && (
+                        <div className="flex flex-wrap gap-1.5">
+                          {n.expected_inputs.map((inp) => (
+                            <span key={inp} className="rounded-md border border-white/10 bg-white/5 px-1.5 py-0.5 text-[11px] text-[#9CA3AF]">
+                              {inp}
+                            </span>
+                          ))}
+                        </div>
+                      )}
+                      {n.source_path && <p className="pt-1 text-xs text-slate-600">{n.source_path}</p>}
+                    </div>
+                  )}
+                </li>
+              );
+            })}
+          </ul>
+
+          {flow.edges.length === 0 ? (
+            <p className="mt-4 text-sm text-[#9CA3AF]">This flow has no edges.</p>
+          ) : (
+            <>
+              <button
+                onClick={() => setEdgesOpen((e) => !e)}
+                className="mt-4 flex items-center gap-1.5 text-sm font-medium text-[#F8FAFC] transition hover:text-white"
+              >
+                {edgesOpen ? (
+                  <ChevronDown className="h-3.5 w-3.5 shrink-0 text-[#9CA3AF]" strokeWidth={1.5} />
+                ) : (
+                  <ChevronRight className="h-3.5 w-3.5 shrink-0 text-[#9CA3AF]" strokeWidth={1.5} />
+                )}
+                Edges ({flow.edges.length})
+              </button>
+              {edgesOpen && (
+                <ul className="mt-2 space-y-1.5 pl-5">
+                  {flow.edges.map((e, i) => (
+                    <li key={i} className="flex items-center gap-2 text-sm text-[#D1D5DB]">
+                      <FileCode2 className="h-3.5 w-3.5 shrink-0 text-[#9CA3AF]" strokeWidth={1.5} />
+                      {nodeName(e.from)}
+                      <ArrowRight className="h-3.5 w-3.5 shrink-0 text-[#9CA3AF]" strokeWidth={1.5} />
+                      {nodeName(e.to)}
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
 
 function placementText(s: FlowInterruptScenario, label: (id: string) => string): string {
   const p = s.placement;
@@ -2213,7 +1794,7 @@ function FlowScenarioScriptPanel({
         <div className="mt-3 rounded-lg border border-rose-400/30 bg-rose-400/10 px-3 py-3 text-sm text-rose-200">
           <p>
             {work.saved
-              ? "Delete this saved scenario and its script? The flow, its nodes and edges, and any node tests are not affected — the path stays in the preview."
+              ? "Delete this saved scenario and its script? The flow and its nodes and edges are not affected — the path stays in the preview."
               : "Discard this generated draft? It hasn't been saved."}
           </p>
           <div className="mt-2 flex gap-2">
@@ -2248,7 +1829,7 @@ function FlowScenarioScriptPanel({
   );
 }
 
-// Same presentation as the node test's result block, reusing the dashboard's own
+// The run's result block, reusing the dashboard's own
 // transcript view.
 function FlowRunResult({ report }: { report: Report }) {
   const conv = report.conversations[0];

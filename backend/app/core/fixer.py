@@ -113,8 +113,20 @@ async def explain_and_fix(conversation: Any) -> dict:
         )
         evidence = None
 
+    # An interrupt scenario's Judge evidence carries its planned-vs-observed interrupt
+    # facts and what failed (app.core.judge); keep it, with this cause's snippet after it,
+    # rather than replacing it. Every other scenario is unchanged.
+    if evidence and conv.get("evidence") and _is_interrupt_scenario(scenario):
+        evidence = f"{conv['evidence']} | Cause evidence: {evidence}"[:1500]
+
     update_conversation_fix(conv_id, explanation, suggested_fix, evidence)
     return {"explanation": explanation, "suggested_fix": suggested_fix, "evidence": evidence}
+
+
+def _is_interrupt_scenario(scenario: dict) -> bool:
+    from app.core.judge import _interrupt_plan
+
+    return _interrupt_plan(scenario) is not None
 
 
 async def explain_and_fix_by_id(conversation_id: int) -> dict:

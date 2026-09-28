@@ -905,6 +905,11 @@ def _resolve_scenario(flow_id: int, graph: dict, scenario_id: str) -> dict:
     return scenario
 
 
+def _graph_node_kinds(graph: dict) -> dict[str, str]:
+    """node id -> type, for validate_path_script's no-reply steps."""
+    return {str(n["id"]): str(n.get("type") or "") for n in graph["nodes"]}
+
+
 def _verify_path(flow_id: int, graph: dict, scenario_id: str, path: list[str]) -> None:
     """409 unless `path` is exactly the path `scenario_id` names and is walkable in this
     flow: non-empty, every node exists, every consecutive pair is a real edge. Never
@@ -979,7 +984,7 @@ def save_flow_scenario_script(flow_id: int, scenario_id: str, body: SaveFlowScen
     _, graph = _load_flow_graph(flow_id)
     scenario = _resolve_scenario(flow_id, graph, scenario_id)
     try:
-        script = validate_path_script(body.model_dump(), scenario["path"])
+        script = validate_path_script(body.model_dump(), scenario["path"], _graph_node_kinds(graph))
     except NodeScriptError as e:
         raise HTTPException(status_code=422, detail={"errors": e.errors}) from e
     row = upsert_flow_scenario_script(flow_id, scenario, script["test_goal"], script["turns"])
@@ -1033,7 +1038,8 @@ async def run_flow_scenario(flow_id: int, scenario_id: str) -> dict:
     _verify_path(flow_id, graph, scenario_id, scenario["path"])
     try:
         script = validate_path_script(
-            {"test_goal": scenario["test_goal"], "turns": scenario["turns"]}, scenario["path"]
+            {"test_goal": scenario["test_goal"], "turns": scenario["turns"]}, scenario["path"],
+            _graph_node_kinds(graph),
         )
     except NodeScriptError as e:
         raise HTTPException(status_code=422, detail={"errors": e.errors}) from e

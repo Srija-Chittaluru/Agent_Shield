@@ -430,3 +430,29 @@ async def test_judge_error_on_a_normal_scenario_keeps_the_existing_fallback(monk
     msgs = _msgs(("tester", "Hi.", None), ("agent", "Hello.", None))
     result = await _Sequence(monkeypatch, row, msgs, [RuntimeError("model down")])()
     assert result["verdict"] == "pass" and result["evidence"] == "judge unavailable"
+
+
+# ---------------------------------------------------------------------------
+# Explain + fix keeps the interrupt evidence (Part 9)
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("interrupt", [True, False])
+async def test_fixer_keeps_the_judges_interrupt_evidence(monkeypatch, interrupt):
+    from app.core import fixer
+
+    row = _row("human_request")[0] if interrupt else {"id": 1, "test_type": "flow_path", "assigned_fault": "none",
+                                                       "expected_behavior": "x"}
+    saved = {}
+    monkeypatch.setattr(fixer, "get_scenario", lambda sid: row)
+    monkeypatch.setattr(fixer, "get_messages", lambda cid: GOTO_MSGS)
+    monkeypatch.setattr(fixer, "update_conversation_fix", lambda cid, e, f, ev: saved.update(evidence=ev))
+
+    async def chat(system, messages, **kw):
+        return {"explanation": "why", "suggested_fix": "fix", "evidence": "agent: re-asked availability"}
+
+    monkeypatch.setattr(fixer, "chat", chat)
+    judge_evidence = "Planned interrupt: human_request (goto → route_counsellor_hours). Observed interrupt key: none; end status: none."
+    await fixer.explain_and_fix({"id": 5, "scenario_id": 1, "severity": "high", "evidence": judge_evidence})
+    if interrupt:
+        assert saved["evidence"] == f"{judge_evidence} | Cause evidence: agent: re-asked availability"
+    else:
+        assert saved["evidence"] == "agent: re-asked availability"  # unchanged behaviour

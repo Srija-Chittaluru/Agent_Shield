@@ -333,9 +333,28 @@ TURN RULES:
 - One turn per step where the caller has to reply, in path order; "step" values strictly increase.
 - Steps where the caller needs to say nothing (e.g. the agent is only routing or deciding
   internally) get no turn.
+- A step marked "caller: NO turn" (the agent only speaks there, routes internally, or ends the
+  call) NEVER gets a turn — not even one with an empty caller_line. The agent's own words at such
+  a step (its greeting, a thank-you, a closing line) are never the caller's line. The caller
+  answers at the next step marked "caller: replies here".
 - Cover the path from its first step to its end."""
 
 _PLACEHOLDER = re.compile(r"\{[^{}]*\}|\[[^\[\]]*\]|<[^<>]*>")
+
+# Step kinds (the modular flow parser's node types) where the caller never replies: the
+# agent only speaks (say), routes internally (branch) or ends the call (end). The target
+# goes straight on from a say step to its next question, so a caller line written for a
+# say step would be heard as the answer to that NEXT question. Flows whose nodes carry
+# no such kinds are unaffected.
+SILENT_STEP_KINDS = {
+    "say": "the agent only speaks there",
+    "branch": "the agent routes internally there",
+    "end": "the agent ends the call there",
+}
+
+
+def _node_kinds(nodes_by_id: dict[str, dict]) -> dict[str, str]:
+    return {str(k): str(n.get("type") or "") for k, n in nodes_by_id.items()}
 
 
 def _build_path_prompt(
@@ -348,6 +367,11 @@ def _build_path_prompt(
         if node_id in path[:i]:
             header += f" (returns to the node from step {path.index(node_id) + 1})"
         parts.append(f"{header}:\n{_describe_node(node)}")
+        kind = str(node.get("type") or "")
+        if kind in SILENT_STEP_KINDS:
+            parts.append(f"  caller: NO turn at this step ({SILENT_STEP_KINDS[kind]})")
+        elif kind == "ask":
+            parts.append("  caller: replies here")
         if i + 1 < len(path):
             taken = path[i + 1]
             others = [t for t in out_adj.get(node_id, []) if t != taken]
@@ -358,13 +382,14 @@ def _build_path_prompt(
     return "\n".join(parts)
 
 
-def validate_path_script(result: object, path: list[str]) -> dict:
+def validate_path_script(result: object, path: list[str], node_kinds: Optional[dict[str, str]] = None) -> dict:
     """Validate a flow scenario script against its path; return
     {"test_goal": str, "turns": [{"step", "node_id", "expected_agent_behavior",
     "caller_line"}, ...]} normalized. Raises NodeScriptError with every problem found.
 
     Used both on model output and on a user's edited script before it is saved, so an
-    edit can't break path correspondence either.
+    edit can't break path correspondence either. With `node_kinds` (node id -> type), a
+    turn at a step where the caller never replies (SILENT_STEP_KINDS) is rejected.
     """
     if not isinstance(result, dict):
         raise NodeScriptError(["Script must be a JSON object."])
@@ -381,6 +406,7 @@ def validate_path_script(result: object, path: list[str]) -> dict:
         raw_turns = []
 
     last_step = 0
+    silent_errors: list[str] = []
     for i, t in enumerate(raw_turns):
         if not isinstance(t, dict):
             continue  # reported by validate_script below
@@ -399,6 +425,12 @@ def validate_path_script(result: object, path: list[str]) -> dict:
                 f"turns[{i}].node_id must be '{expected_node}' (the node at step {step}), "
                 f"got {t.get('node_id')!r}."
             )
+        kind = (node_kinds or {}).get(expected_node, "")
+        if kind in SILENT_STEP_KINDS:
+            silent_errors.append(
+                f"turns[{i}]: step {step} ({expected_node}) is a '{kind}' step — {SILENT_STEP_KINDS[kind]} "
+                "and the caller does not reply; remove this turn (the caller answers at the next 'ask' step)."
+            )
         caller_line = t.get("caller_line")
         if isinstance(caller_line, str) and _PLACEHOLDER.search(caller_line):
             errors.append(
@@ -408,7 +440,11 @@ def validate_path_script(result: object, path: list[str]) -> dict:
         steps.append((step, expected_node))
 
     fields: list[dict] = []
-    if raw_turns:
+    if silent_errors:
+        # Report the misplaced turns themselves, not the empty caller lines they tend to
+        # carry — removing them is the fix.
+        errors.extend(silent_errors)
+    elif raw_turns:
         try:
             fields = validate_script(raw_turns, max_turns=len(path))
         except NodeScriptError as e:
@@ -438,7 +474,7 @@ async def generate_path_script(
         messages=[{"role": "user", "content": _build_path_prompt(path, nodes_by_id, out_adj, category)}],
         json_mode=True,
     )
-    return validate_path_script(result, path)
+    return validate_path_script(result, path, _node_kinds(nodes_by_id))
 
 
 # Test type for an executed flow scenario (Phase E). Its own type rather than

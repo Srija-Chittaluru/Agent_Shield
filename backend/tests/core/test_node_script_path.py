@@ -172,3 +172,85 @@ def test_path_prompt_is_separate_from_the_node_prompt():
     assert node_script.PATH_SYSTEM_PROMPT is not node_script.SYSTEM_PROMPT
     assert "test script for ONE node" in node_script.SYSTEM_PROMPT
     assert "ONE EXACT PATH" in node_script.PATH_SYSTEM_PROMPT
+
+
+# ---------------------------------------------------------------------------
+# Steps where the caller never replies (say / branch / end in a modular flow)
+# ---------------------------------------------------------------------------
+from tests.routers.test_flow_interrupt_scenarios import PARSED  # noqa: E402
+
+MAYA_NODES = {str(n["id"]): n for n in PARSED["nodes"]}
+MAYA_KINDS = {k: str(n.get("type") or "") for k, n in MAYA_NODES.items()}
+# "Branch Scenario 13" of the Maya modular flow.
+BRANCH_13 = ["greet", "ask_good_time", "route_good_time", "ask_identity", "route_identity", "ask_dob",
+             "route_dob", "thank_for_verifying", "ask_packet_received", "route_packet", "ask_already_sent",
+             "route_sent", "ask_online_account", "route_online_account", "ask_has_email", "route_prereqs",
+             "close_counsellor_setup", "route_counsellor_direct", "end_counsellor_transfer"]
+ASK_LINES = {2: "Yes, I have a couple of minutes.", 4: "Yes, that's me.", 6: "March 14th, 1985.",
+             9: "Yes, I got the packet.", 11: "Yes, I sent it back.", 13: "Yes, I'd like my own account.",
+             15: "I have an email and I'm at my computer."}
+
+
+def _branch_13(extra=()):
+    turns = [_turn(step, BRANCH_13[step - 1], line) for step, line in ASK_LINES.items()]
+    turns += [_turn(step, BRANCH_13[step - 1], line) for step, line in extra]
+    return {"test_goal": "g", "turns": sorted(turns, key=lambda t: t["step"])}
+
+
+def test_asks_only_script_is_valid_on_a_modular_flow():
+    out = validate_path_script(_branch_13(), BRANCH_13, MAYA_KINDS)
+    assert [t["step"] for t in out["turns"]] == [2, 4, 6, 9, 11, 13, 15]
+
+
+def test_the_reported_model_output_is_rejected_with_a_clear_reason():
+    """The actual failing draft: the agent's greeting as the caller's first line, and
+    empty lines at the two say steps."""
+    script = _branch_13([(1, "Hello, this is John Smith calling from ABC Health Services about my renewal."),
+                         (8, ""), (17, "")])
+    with pytest.raises(NodeScriptError) as exc:
+        validate_path_script(script, BRANCH_13, MAYA_KINDS)
+    errors = exc.value.errors
+    assert errors == [
+        "turns[0]: step 1 (greet) is a 'say' step — the agent only speaks there and the caller does not reply; "
+        "remove this turn (the caller answers at the next 'ask' step).",
+        "turns[4]: step 8 (thank_for_verifying) is a 'say' step — the agent only speaks there and the caller "
+        "does not reply; remove this turn (the caller answers at the next 'ask' step).",
+        "turns[9]: step 17 (close_counsellor_setup) is a 'say' step — the agent only speaks there and the "
+        "caller does not reply; remove this turn (the caller answers at the next 'ask' step).",
+    ]
+    assert not any("caller_line must be a non-empty string" in e for e in errors)
+
+
+@pytest.mark.parametrize("step, kind", [(3, "branch"), (19, "end")])
+def test_turns_at_branch_and_end_steps_are_rejected(step, kind):
+    with pytest.raises(NodeScriptError) as exc:
+        validate_path_script(_branch_13([(step, "Okay.")]), BRANCH_13, MAYA_KINDS)
+    assert f"is a '{kind}' step" in exc.value.errors[0]
+
+
+def test_flows_without_step_kinds_are_unaffected():
+    # Untyped / differently typed flows (e.g. a JSON flow) keep the existing rules.
+    assert len(validate_path_script(GOOD, PATH, {n: "" for n in PATH})["turns"]) == 4
+    assert len(validate_path_script(GOOD, PATH, {"greeting": "greeting"})["turns"]) == 4
+    assert len(validate_path_script(_branch_13([(1, "Hello.")]), BRANCH_13)["turns"]) == 8  # no kinds given
+
+
+def test_path_prompt_marks_which_steps_get_a_turn():
+    prompt = node_script._build_path_prompt(BRANCH_13, MAYA_NODES, {}, "branch")
+    step1 = prompt[prompt.index("Step 1:"):prompt.index("Step 2:")]
+    step2 = prompt[prompt.index("Step 2:"):prompt.index("Step 3:")]
+    step3 = prompt[prompt.index("Step 3:"):prompt.index("Step 4:")]
+    assert "caller: NO turn at this step (the agent only speaks there)" in step1
+    assert "caller: replies here" in step2
+    assert "caller: NO turn at this step (the agent routes internally there)" in step3
+    assert 'NEVER gets a turn — not even one with an empty caller_line' in node_script.PATH_SYSTEM_PROMPT
+
+
+async def test_generate_path_script_applies_the_rule(monkeypatch):
+    async def fake_chat(*a, **kw):
+        return _branch_13([(8, "")])
+
+    monkeypatch.setattr(node_script, "chat", fake_chat)
+    with pytest.raises(NodeScriptError) as exc:
+        await generate_path_script(BRANCH_13, MAYA_NODES, {}, "branch")
+    assert "step 8 (thank_for_verifying) is a 'say' step" in exc.value.errors[0]

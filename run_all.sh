@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # AgentShield — start everything with one command.
 #   ./run_all.sh
-# Starts: backend (8100), 6 sample agents (8002-8007), and the frontend (3000).
+# Starts: backend (8100), 6 sample agents (8002-8007), and the frontend (3100).
 # Ctrl-C stops them all.
 set -u
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -16,7 +16,7 @@ cleanup() {
   echo "Stopping AgentShield…"
   for pid in "${pids[@]}"; do kill "$pid" 2>/dev/null; done
   # free the ports in case anything lingers
-  for p in 8100 8002 8003 8004 8005 8006 8007 3000 7233 8233; do lsof -ti:$p | xargs kill 2>/dev/null; done
+  for p in 8100 8002 8003 8004 8005 8006 8007 3100 7233 8233; do lsof -ti:$p | xargs kill 2>/dev/null; done
   exit 0
 }
 trap cleanup INT TERM
@@ -62,7 +62,7 @@ else
   echo "  → Temporal: 'temporal' CLI not found — skipping (brew install temporal)"
 fi
 
-echo "  → Frontend on :3000"
+echo "  → Frontend on :3100"
 ( cd "$FE" && npm run dev ) &
 pids+=($!)
 
@@ -71,7 +71,7 @@ cat <<EOF
 
 ────────────────────────────────────────────────────────────
 AgentShield is up:
-  • App (open this):     http://localhost:3000
+  • App (open this):     http://localhost:3100
   • Backend API:         http://localhost:8100/health
   Agents under test (each has its own chat UI at its root):
   • Store Support:       http://localhost:8002/

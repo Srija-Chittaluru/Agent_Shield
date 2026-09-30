@@ -38,7 +38,7 @@ code, its prompts, or its weights — just the endpoint.
 
 ```
 ┌─────────────────────────────┐        ┌──────────────────────────────┐
-│  FRONTEND (Next.js :3000)   │        │  AGENT(S) UNDER TEST          │
+│  FRONTEND (Next.js :3100)   │        │  AGENT(S) UNDER TEST          │
 │  Connect a new agent, or    │        │  (:8002–:8007) — 6 sample RAG │
 │  reuse an existing one      │        │  agents shipped with the repo,│
 │  Wizard: Connect→Verify→    │        │  or any third-party endpoint  │
@@ -76,7 +76,7 @@ code, its prompts, or its weights — just the endpoint.
   and development test genuinely non-deterministic agents, not scripted mocks — and the
   same pipeline works against any third-party HTTP endpoint.
 
-**Ports:** frontend `3000`, backend `8100`, Temporal server `7233` (Web UI `8233`), sample
+**Ports:** frontend `3100`, backend `8100`, Temporal server `7233` (Web UI `8233`), sample
 agents `8002`–`8007`. One command starts all of it: `./run_all.sh`.
 
 ---
@@ -448,11 +448,11 @@ needed even once Postgres and Temporal were added.
 ./run_all.sh
 ```
 Starts the backend (`:8100`), all 6 sample agents (`:8002`–`:8007`), the Temporal dev
-server + worker (if the `temporal` CLI is installed), and the frontend (`:3000`). Ctrl-C
+server + worker (if the `temporal` CLI is installed), and the frontend (`:3100`). Ctrl-C
 stops all of it. See `README.md` for prerequisites (PostgreSQL, the Temporal CLI, an
 OpenAI key) and running pieces by hand instead.
 
-Open http://localhost:3000 → **Start Testing** → either **Connect Your AI Agent** (a fresh
+Open http://localhost:3100 → **Start Testing** → either **Connect Your AI Agent** (a fresh
 endpoint) or **Existing Agent Testing** (reuse a stored one, sample or previously
 connected).
 

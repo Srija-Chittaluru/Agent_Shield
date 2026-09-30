@@ -52,9 +52,9 @@ on localhost with defaults.
 ```
 One command starts everything: the AgentShield backend (`:8100`), all 6 sample agents
 (`:8002`–`:8007`), the Temporal dev server + worker (if the `temporal` CLI is installed), and
-the frontend (`:3000`). Ctrl-C stops all of it.
+the frontend (`:3100`). Ctrl-C stops all of it.
 
-Then open **http://localhost:3000**.
+Then open **http://localhost:3100**.
 
 **Temporal is required, not optional.** Every crash-test run is submitted as a Temporal
 workflow (`AgentTestWorkflow` / `RunGroupWorkflow`) so it survives a backend restart and runs
@@ -73,7 +73,7 @@ cd backend
 .venv/bin/python -m app.temporal.worker                 # worker (needs the Temporal server up)
 .venv/bin/uvicorn sample_rag_bot.main:app --port 8002    # + any sample agent you want, see below
 
-cd frontend && npm run dev                               # :3000
+cd frontend && npm run dev                               # :3100
 ```
 
 ## The two ways to test an agent

@@ -512,7 +512,7 @@ Browser (http://localhost:5173)
 
 ### How to test Phase 4 yourself
 
-Historical port (5173) — the app now runs on **3000**; see README.md.
+Historical port (5173) — the app now runs on **3100**; see README.md.
 
 ```bash
 # Terminal 1: .venv/bin/uvicorn sample_rag_bot.main:app --port 8002

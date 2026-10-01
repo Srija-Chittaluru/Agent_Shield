@@ -171,3 +171,141 @@ async def test_empty_utterance_from_the_model_also_falls_back(monkeypatch):
         objective="x", customer_context="y", expected_behavior="", transcript=[], turn_number=1, max_turns=4,
     )
     assert result["utterance"]  # falls back rather than sending a blank message
+
+
+# ---------------------------------------------------------------------------
+# Regression: the caller must not front-load future scenario facts before the agent has
+# actually asked for them (reported bug — a Medi-Cal renewal call where the caller
+# answered "yes, I received the packet at my address on Maple Street" in reply to
+# Maya's opening "do you have a couple of minutes?").
+# ---------------------------------------------------------------------------
+_MAYA_GREETING = (
+    "Hello, this is Maya calling from La Clinica Primary Care about your yearly "
+    "Medi-Cal renewal. This call is recorded, and it'll only take a couple of minutes. "
+    "Would you have a couple of minutes to talk about your Medi-Cal renewal?"
+)
+_DANIEL_CONTEXT = (
+    "Daniel, a Medi-Cal patient. He received his renewal packet at his address on "
+    "Maple Street but has not mailed it back yet. He wants to set up an online account "
+    "instead of a paper one. He is currently available and at his computer, though he is "
+    "not always free to come to the phone."
+)
+
+
+async def test_case1_opening_turn_prompt_instructs_against_revealing_future_facts(monkeypatch):
+    """Case 1: on the opening turn (a greeting + a simple yes/no question), the prompt
+    must tell the model to answer only that, not volunteer later facts — while the facts
+    themselves are still fully available to it as memory, never stripped out."""
+    captured = {}
+
+    async def fake_chat(system, messages, json_mode=False, **kwargs):
+        captured["system"] = system
+        captured["user"] = messages[0]["content"]
+        return {"utterance": "Hi Maya, yes, I have a couple of minutes.", "done": False}
+
+    monkeypatch.setattr(ai_caller, "chat", fake_chat)
+
+    result = await ai_caller.next_utterance(
+        objective="Confirm Daniel is available and willing to discuss his Medi-Cal renewal.",
+        customer_context=_DANIEL_CONTEXT,
+        expected_behavior="",
+        transcript=[{"role": "agent", "content": _MAYA_GREETING}],
+        turn_number=0, max_turns=6,
+    )
+
+    assert "reveal any piece of it only when" in captured["system"]
+    assert "do not immediately volunteer later facts" in captured["system"]
+    assert "Answer only what the agent's LATEST message" in captured["user"]
+    assert "Maple Street" in captured["user"]  # the fact is still available, just not forced
+    assert result["utterance"] == "Hi Maya, yes, I have a couple of minutes."
+
+
+async def test_case2_packet_fact_is_used_once_the_agent_asks_about_the_packet(monkeypatch):
+    """Case 2: once Maya's own question calls for it, the caller may use the matching
+    fact from customer_context."""
+    async def fake_chat(system, messages, json_mode=False, **kwargs):
+        prompt = messages[0]["content"]
+        if "did you receive the packet" in prompt.lower():
+            return {"utterance": "Yes, I received it at my address on Maple Street.", "done": False}
+        raise AssertionError(f"unexpected prompt: {prompt}")
+
+    monkeypatch.setattr(ai_caller, "chat", fake_chat)
+
+    result = await ai_caller.next_utterance(
+        objective="Confirm Daniel received his Medi-Cal renewal packet.",
+        customer_context=_DANIEL_CONTEXT,
+        expected_behavior="",
+        transcript=[
+            {"role": "tester", "content": "Hi Maya, yes, I have a couple of minutes."},
+            {"role": "agent", "content": "Great — did you receive the packet in the mail?"},
+        ],
+        turn_number=1, max_turns=6,
+    )
+    assert result["utterance"] == "Yes, I received it at my address on Maple Street."
+
+
+async def test_case3_availability_question_gets_answered_not_an_unrelated_fact(monkeypatch):
+    """Case 3: asked whether Daniel is available, the caller answers THAT — not the
+    packet, online-account, or computer facts also sitting in its customer context."""
+    async def fake_chat(system, messages, json_mode=False, **kwargs):
+        prompt = messages[0]["content"]
+        if "Is Daniel available to come to the phone" in prompt:
+            return {"utterance": "This is Daniel, I'm right here.", "done": False}
+        raise AssertionError(f"unexpected prompt: {prompt}")
+
+    monkeypatch.setattr(ai_caller, "chat", fake_chat)
+
+    result = await ai_caller.next_utterance(
+        objective="Confirm Daniel is available and willing to discuss his Medi-Cal renewal.",
+        customer_context=_DANIEL_CONTEXT,
+        expected_behavior="",
+        transcript=[{"role": "agent", "content": "Is Daniel available to come to the phone?"}],
+        turn_number=1, max_turns=6,
+    )
+    assert result["utterance"] == "This is Daniel, I'm right here."
+    assert "packet" not in result["utterance"].lower()
+
+
+async def test_case4_online_account_fact_surfaces_only_when_relevant(monkeypatch):
+    """Case 4: asked about setting up an online account, the caller uses that fact —
+    still only because THIS turn's question calls for it."""
+    async def fake_chat(system, messages, json_mode=False, **kwargs):
+        prompt = messages[0]["content"]
+        if "set up an online account" in prompt:
+            return {"utterance": "Yes, I'd like to set up my own account.", "done": False}
+        raise AssertionError(f"unexpected prompt: {prompt}")
+
+    monkeypatch.setattr(ai_caller, "chat", fake_chat)
+
+    result = await ai_caller.next_utterance(
+        objective="Confirm Daniel received his Medi-Cal renewal packet.",
+        customer_context=_DANIEL_CONTEXT,
+        expected_behavior="",
+        transcript=[{"role": "agent", "content": "Would you like to set up an online account instead?"}],
+        turn_number=2, max_turns=6,
+    )
+    assert result["utterance"] == "Yes, I'd like to set up my own account."
+
+
+async def test_case5_scenario_goal_still_reaches_the_prompt_alongside_the_new_instruction(monkeypatch):
+    """Case 5: the anti-front-loading instruction is additive, not a replacement — the
+    scenario's objective and full customer context still reach the prompt every turn,
+    so the fix cannot silently make the caller generic or lose the test's intent."""
+    captured = {}
+
+    async def fake_chat(system, messages, json_mode=False, **kwargs):
+        captured["user"] = messages[0]["content"]
+        return {"utterance": "ok", "done": False}
+
+    monkeypatch.setattr(ai_caller, "chat", fake_chat)
+
+    await ai_caller.next_utterance(
+        objective="Confirm Daniel received his Medi-Cal renewal packet.",
+        customer_context=_DANIEL_CONTEXT,
+        expected_behavior="",
+        transcript=[{"role": "agent", "content": _MAYA_GREETING}],
+        turn_number=0, max_turns=6,
+    )
+
+    assert "Confirm Daniel received his Medi-Cal renewal packet." in captured["user"]
+    assert _DANIEL_CONTEXT in captured["user"]

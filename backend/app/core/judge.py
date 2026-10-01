@@ -7,8 +7,10 @@ to the conversation row.
 import json
 from typing import Any
 
+from app.core import flow_oracle
 from app.core.adapter import SYSTEM_FAULTS
 from app.core.llm import FIXED_SEED, chat
+from app.core.node_script import parse_plain_path_script
 from app.db import (
     get_agent,
     get_messages,
@@ -131,6 +133,161 @@ Add this object to your json:
 "interrupt":{"recognized":true|false,"handled":true|false,"outcome_met":true|false,
  "expected_outcome_met":true|false,"violated_bug_guards":[numbers],
  "observed":"one sentence: what the agent actually did"}"""
+
+
+# ---------------------------------------------------------------------------
+# Flow-path scenarios (app.core.node_script.path_script_to_scenario) that are NOT an
+# interrupt scenario. Their expected_behavior lists EVERY step of the planned path, but
+# _run_scripted (app.core.runner) stops playing seed_turns as soon as the voice session
+# ends (session_ended_fn) — so a real agent that legitimately ends/retries the call
+# partway through produces a SHORTER transcript than the full planned script. Without
+# this, the Judge sees the full expected_behavior text and treats every unreached step
+# as something the agent should have exhibited, which is a false failure. Added to the
+# prompt below ONLY for such a scenario; every other scenario's prompt is unchanged.
+# ---------------------------------------------------------------------------
+FLOW_PATH_RULES = """
+
+FLOW-PATH SCENARIOS — apply ONLY when the user message contains a PLANNED PATH block. The
+scenario's expected_behavior lists EVERY step of the path that was planned, but a real agent can
+legitimately end the call, retry, or take an early exit before reaching later steps — that alone
+is not a failure. Use the REACHED STEPS / STEPS NEVER REACHED split:
+- Judge "accuracy" ONLY against the REACHED STEPS' expected behavior — a step the conversation
+  never reached is not evidence of anything the agent did or didn't do.
+- A never-reached step counts against the agent ONLY if the scenario's own goal/expected_behavior
+  explicitly states the conversation must continue to that point regardless (e.g. "the agent must
+  keep asking the renewal questions even if the contact is unavailable"). If it does not say that,
+  ending the call early is not itself evidence of failure.
+- Still fail the agent for anything it actually did wrong in the REACHED steps (wrong information,
+  unsafe behavior, ignoring what the caller actually said, or ending in a way the scenario's own
+  goal clearly disallows).
+
+When a BRANCH OPTIONS block is also present, it is read directly from the agent's own parsed
+implementation — its actual labeled transitions at the point the conversation stopped, never
+invented. Use it to judge whether the agent's observed behavior matches one of ITS OWN valid
+branch options (e.g. a decline/unavailable option ending the call is correct if the flow itself
+offers that transition there), not whether it matches what you'd personally expect. Any step
+listed under STEPS NO LONGER REACHABLE is stronger than "unreached": the flow's own structure
+shows it is no longer possible from here, so it must NEVER be evaluated or held against the agent,
+even if the scenario's goal text seems to want continuation — a structurally impossible step
+cannot be what that goal meant."""
+
+
+def _flow_path_plan(scenario: dict) -> dict | None:
+    """The saved plain (non-interrupt) flow-path script of a flow_path scenario — thin
+    wrapper so every other function in this module keeps calling the short local name;
+    see app.core.node_script.parse_plain_path_script for the actual shape/parsing."""
+    return parse_plain_path_script(scenario.get("node_script_json"))
+
+
+def _flow_path_context(plan: dict, msgs: list[dict]) -> str:
+    """PLANNED PATH / REACHED STEPS / STEPS NEVER REACHED blocks for a flow_path
+    scenario. seed_turns[i] == turns[i]["caller_line"] by construction
+    (path_script_to_scenario), and _run_scripted plays seed_turns strictly in order, so
+    the number of actual tester turns in the transcript is exactly how many of `turns`
+    were reached — no text-matching needed."""
+    turns = plan.get("turns") or []
+    n_tester = sum(1 for m in msgs if m.get("role") == "tester")
+    reached, unreached = turns[:n_tester], turns[n_tester:]
+
+    def line(t: dict) -> str:
+        return f"  step {t.get('step')} ({t.get('node_id')}): {t.get('expected_agent_behavior')}"
+
+    lines = [
+        "PLANNED PATH (fixed by the test plan; the conversation may legitimately end before its end)",
+        f"  path: {' -> '.join(str(n) for n in (plan.get('path') or []))}",
+        "",
+        "REACHED STEPS (the conversation actually got this far — evaluate accuracy ONLY against these)",
+    ]
+    lines += [line(t) for t in reached] if reached else [
+        "  none — the conversation ended before the first scripted reply"
+    ]
+    lines += ["", "STEPS NEVER REACHED (the conversation ended/stopped before this point)"]
+    if unreached:
+        lines += [line(t) for t in unreached]
+        lines.append(
+            "  Do NOT fail the agent for not exhibiting these behaviors — they were never "
+            "triggered. Only count one of these against the agent if the scenario's own "
+            "goal/expected_behavior explicitly requires continuing past where it actually stopped."
+        )
+    else:
+        lines.append("  none — every planned step was reached")
+    return "\n".join(lines)
+
+
+def _flow_path_facts(plan: dict, msgs: list[dict]) -> str:
+    """One deterministic reached-vs-planned line, prefixed to the evidence — same role
+    as _interrupt_facts for an interrupt scenario."""
+    turns = plan.get("turns") or []
+    n_tester = sum(1 for m in msgs if m.get("role") == "tester")
+    if not turns or n_tester >= len(turns):
+        return f"Planned path: all {len(turns)} scripted step(s) were reached."
+    nxt = turns[n_tester]
+    return (
+        f"Planned path: {n_tester} of {len(turns)} scripted step(s) were reached; the "
+        f"conversation ended before step {nxt.get('step')} ({nxt.get('node_id')}) — not "
+        "evaluated unless the scenario's goal required continuing past that point."
+    )
+
+
+def _branch_oracle(scenario: dict, plan: dict, traces: list[dict]) -> dict | None:
+    """{"active_node", "options", "unreachable"} derived from the agent's OWN reported
+    field answers against its OWN parsed flow (see app.core.flow_oracle) — None when
+    the deterministic data needed isn't available (the transport/agent never reports
+    answers, or the flow has no stored edges)."""
+    return flow_oracle.branch_oracle(scenario.get("flow_id"), traces, plan.get("turns") or [])
+
+
+def _branch_oracle_facts(oracle: dict) -> str:
+    """One deterministic active-node/unreachable-steps line, prefixed to the evidence —
+    same role as _flow_path_facts, but grounded in the agent's own implementation
+    rather than just the planned script's position."""
+    if not oracle["unreachable"]:
+        return (
+            f"Branch oracle: active node {oracle['active_node']!r} (from the agent's own "
+            "reported answers); every remaining planned step is still reachable from there."
+        )
+    names = ", ".join(f"step {t.get('step')} ({t.get('node_id')})" for t in oracle["unreachable"])
+    return (
+        f"Branch oracle: active node {oracle['active_node']!r} (from the agent's own reported "
+        f"answers); no longer reachable from there: {names}."
+    )
+
+
+def _branch_oracle_block(oracle: dict | None) -> str:
+    """BRANCH OPTIONS / STEPS NO LONGER REACHABLE prompt block for an already-computed
+    oracle (see _branch_oracle) — empty string when one isn't available, degrading to
+    whatever _flow_path_context already gave the Judge, never an error."""
+    if not oracle:
+        return ""
+    lines = [
+        "BRANCH OPTIONS IN THE AGENT'S OWN FLOW (read directly from its parsed "
+        f"implementation, at node '{oracle['active_node']}' — the flow's own "
+        "transitions applied to the agent's own reported answers; these are the "
+        "flow's own labeled options, never invented)",
+    ]
+    if oracle["options"]:
+        for o in oracle["options"]:
+            desc = f"  -> {o.get('to')}"
+            kind = o.get("type")
+            if kind:
+                desc += f" ({kind}" + (f": {o['label']}" if o.get("label") else "") + ")"
+            if o.get("when"):
+                desc += f" when {o['when']}"
+            lines.append(desc)
+    else:
+        lines.append("  (the flow declares no further transition from this node — a valid terminal point)")
+    if oracle["unreachable"]:
+        lines += [
+            "",
+            "STEPS NO LONGER REACHABLE (the flow's own edges show these require a different "
+            "branch than the one actually taken — NEVER evaluate or fail the agent on these; "
+            "they are not merely unreached, they are now structurally impossible from here):",
+        ]
+        lines += [
+            f"  step {t.get('step')} ({t.get('node_id')}): {t.get('expected_agent_behavior')}"
+            for t in oracle["unreachable"]
+        ]
+    return "\n".join(lines) + "\n\n"
 
 
 def _interrupt_plan(scenario: dict) -> dict | None:
@@ -414,12 +571,19 @@ async def judge_conversation(conversation: Any) -> dict:
     trace_text = json.dumps(traces, indent=2)[:3000]
 
     # An interrupt scenario gets its planned interrupt and the observed trace facts as
-    # extra context; every other scenario's prompt is byte-for-byte what it was.
+    # extra context; a plain flow-path scenario gets its reached/unreached step split
+    # instead; every other scenario's prompt is byte-for-byte what it was.
     plan = _interrupt_plan(scenario)
     observed = _observed(msgs) if plan else None
     reports_signals = _reports_interrupt_keys(conv) if plan else False
     interrupt_block = (
         _interrupt_context(plan, observed, reports_signals) + "\n\n" if plan else ""
+    )
+    flow_path_plan = None if plan else _flow_path_plan(scenario)
+    branch_oracle = _branch_oracle(scenario, flow_path_plan, traces) if flow_path_plan else None
+    flow_path_block = (
+        _flow_path_context(flow_path_plan, msgs) + "\n\n" + _branch_oracle_block(branch_oracle)
+        if flow_path_plan else ""
     )
     if plan:
         # Numbered so the guards and each turn's expected behavior line up with the transcript.
@@ -430,17 +594,23 @@ async def judge_conversation(conversation: Any) -> dict:
         f"  expected_behavior: {scenario.get('expected_behavior')}\n"
         f"  test_type: {scenario.get('test_type')}\n"
         f"  assigned_fault: {assigned_fault}\n\n"
-        f"{interrupt_block}"
+        f"{interrupt_block}{flow_path_block}"
         f"TRANSCRIPT\n{transcript_text}\n\n"
         f"AGENT TRACE (per agent turn)\n{trace_text}\n\n"
         "Judge this conversation now as json."
     )
 
+    system_prompt = SYSTEM_PROMPT
+    if plan:
+        system_prompt += INTERRUPT_RULES
+    elif flow_path_plan:
+        system_prompt += FLOW_PATH_RULES
+
     try:
         # temperature=0 + a fixed seed: the Judge is a measurement, so the same transcript
         # must score the same way twice. The 0.2 default is for generation, not evaluation.
         result = await chat(
-            system=SYSTEM_PROMPT + INTERRUPT_RULES if plan else SYSTEM_PROMPT,
+            system=system_prompt,
             messages=[{"role": "user", "content": user}],
             json_mode=True,
             temperature=0,
@@ -576,6 +746,14 @@ async def judge_conversation(conversation: Any) -> dict:
             parts.append("Failed: " + "; ".join(interrupt_failures) + ".")
         parts.append(evidence)
         evidence = " ".join(p for p in parts if p)[:1200]
+    elif flow_path_plan:
+        # Same deterministic-fact-first pattern as the interrupt case above, so a
+        # reached/unreached false-failure is always traceable from the evidence alone.
+        facts = [_flow_path_facts(flow_path_plan, msgs)]
+        if branch_oracle:
+            facts.append(_branch_oracle_facts(branch_oracle))
+        facts.append(evidence)
+        evidence = " ".join(p for p in facts if p)[:1200]
 
     update_conversation_verdict(conv_id, verdict, severity, recovered, scores, evidence)
     return {

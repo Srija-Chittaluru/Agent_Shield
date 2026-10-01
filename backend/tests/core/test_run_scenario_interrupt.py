@@ -4,8 +4,15 @@ The real Maya fixture is planned with the real planner, a planner-consistent scr
 built (tests.routers.test_flow_interrupt_scripts._script_for) and validated with the
 real validator, then converted with interrupt_script_to_scenario and played by the real
 run_scenario()/_run_scripted(). Only the transport (a scripted fake, or the real
-native_ws transport over a fake socket) and app.db are faked. No caller text may be
-generated at run time.
+native_ws transport over a fake socket) and app.db are faked. The AI Caller may never be
+used at run time.
+
+_run_scripted now passes every seed_turns line through _reactive_scripted_line, which
+calls chat() to react to the agent's actual last reply (see runner.py). The autouse
+fixture below stands chat() in with `fakes_llm.passthrough_chat`, which echoes the
+planned line straight back, so every "exact saved line" assertion below still holds for
+the same reason it always did — a real reactive rewrite is covered separately in
+test_run_scenario_flow_node.py.
 """
 import json
 
@@ -15,6 +22,7 @@ from app.core import runner, voice_caller
 from app.core import voice_native_ws as nws
 from app.core.node_script import PATH_TEST_TYPE, interrupt_script_to_scenario
 from app.routers import flows as R
+from tests.core.fakes_llm import passthrough_chat
 from tests.core.fakes_native_ws import FakeAsyncClient, FakeConnect, FakeWebSocket, turn_frame
 from tests.core.test_run_scenario_session_end import _Agent, _greeting, fake_db  # noqa: F401  (fixture)
 from tests.routers.test_flow_interrupt_scenarios import PARSED
@@ -30,11 +38,14 @@ NAMES = {n["id"]: n.get("name") or n["id"] for n in PARSED["nodes"]}
 
 @pytest.fixture(autouse=True)
 def no_generated_caller_text(monkeypatch):
+    """The AI Caller must never fire for a scripted scenario (still enforced); chat() IS
+    now used, by _reactive_scripted_line, but stood in with a deterministic passthrough
+    so these tests stay exact and network-free."""
     def boom(*a, **kw):
-        raise AssertionError("no caller text may be generated during execution")
+        raise AssertionError("scripted flow scenario must not use the AI Caller")
 
     monkeypatch.setattr(runner, "next_utterance", boom)
-    monkeypatch.setattr(runner, "chat", boom)
+    monkeypatch.setattr(runner, "chat", passthrough_chat)
 
 
 @pytest.fixture(autouse=True)

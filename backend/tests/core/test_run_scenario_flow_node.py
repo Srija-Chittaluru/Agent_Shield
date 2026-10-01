@@ -8,10 +8,23 @@ Same faking approach as test_run_scenario_dynamic.py / test_run_scenario_native_
 app.db is faked in-memory, greeting_fn/send_fn are scripted test doubles (never a real
 LLM or network), and the genuine run_scenario()/_run_scripted() code is exercised
 unmodified.
+
+_run_scripted now passes every flow-authored seed_turns line through
+_reactive_scripted_line, which calls chat() to react to the agent's actual last reply
+(see runner.py). `fakes_llm.passthrough_chat` stands in for that call and echoes the
+planned line straight back, so every test below still sees its scripted lines exactly
+as saved unless it deliberately asks for something else (see
+test_flow_node_caller_line_is_rephrased_to_answer_what_the_agent_actually_asked).
 """
 import pytest
 
 from app.core import runner
+from tests.core.fakes_llm import passthrough_chat
+
+
+@pytest.fixture(autouse=True)
+def deterministic_chat(monkeypatch):
+    monkeypatch.setattr(runner, "chat", passthrough_chat)
 
 
 class _FakeDB:
@@ -231,3 +244,66 @@ async def test_flow_node_scenario_fails_cleanly_when_the_opening_turn_cannot_be_
     assert transcript[0]["role"] == "agent"
     assert transcript[0]["content"] == runner._AGENT_ERROR_SENTINEL
     assert send_fn.calls == []  # the caller line was never sent
+
+
+async def test_flow_node_caller_line_is_rephrased_to_answer_what_the_agent_actually_asked(monkeypatch, fake_db):
+    """Regression for the Maya bug report: a real agent that asks something other than
+    what the seed_turns line was written against (e.g. "may I speak with Daniel?"
+    instead of the anticipated question) must get an answer to what it ACTUALLY asked,
+    never the scripted line recited verbatim as a non-sequitur."""
+    async def reactive_chat(system, messages, json_mode=True):
+        prompt = messages[0]["content"]
+        assert "May I please speak with Daniel?" in prompt  # the agent's real reply is in scope
+        assert "Yes, I received the packet at my address on Maple Street." in prompt  # so is the plan
+        return {"line": "Yes, this is Daniel."}
+
+    monkeypatch.setattr(runner, "chat", reactive_chat)
+
+    async def fake_greeting(agent, session_key):
+        return "May I please speak with Daniel?"
+
+    send_fn = _FakeSendAgent(["Great, thank you."])
+    scenario = _flow_node_scenario(
+        seed_turns=["Yes, I received the packet at my address on Maple Street."]
+    )
+
+    conv_id = await runner.run_scenario(
+        run_id=1, scenario=scenario, agent={"voice_protocol": "native_ws"},
+        send_fn=send_fn, greeting_fn=fake_greeting,
+    )
+
+    assert send_fn.calls[0]["message"] == "Yes, this is Daniel."
+    transcript = fake_db.messages[conv_id]
+    assert transcript[1]["content"] == "Yes, this is Daniel."
+
+
+async def test_flow_node_prompt_warns_against_shallow_yes_no_polarity_matching(monkeypatch, fake_db):
+    """Regression for a second live failure: given a seed_turns line that happens to
+    START with "Yes"/"No", a model can wrongly treat that as "answering" a differently
+    worded yes/no question from the agent (e.g. answering "would you have a couple of
+    minutes?" with "Yes, I received the packet..."). The system prompt must explicitly
+    warn against this exact shallow match, with a concrete counter-example."""
+    captured = {}
+
+    async def reactive_chat(system, messages, json_mode=True):
+        captured["system"] = system
+        return {"line": "Hi Maya, yes, I have a couple of minutes."}
+
+    monkeypatch.setattr(runner, "chat", reactive_chat)
+
+    async def fake_greeting(agent, session_key):
+        return "Would you have a couple of minutes to talk about your Medi-Cal renewal?"
+
+    send_fn = _FakeSendAgent(["Great, thanks."])
+    scenario = _flow_node_scenario(
+        seed_turns=["Yes, I received the packet at my address on Maple Street."]
+    )
+
+    await runner.run_scenario(
+        run_id=1, scenario=scenario, agent={"voice_protocol": "native_ws"},
+        send_fn=send_fn, greeting_fn=fake_greeting,
+    )
+
+    assert "Matching yes/no polarity is NOT enough on its own" in captured["system"]
+    assert "may I speak with Daniel?" in captured["system"]  # the concrete counter-example
+    assert send_fn.calls[0]["message"] == "Hi Maya, yes, I have a couple of minutes."

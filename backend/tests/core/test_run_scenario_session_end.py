@@ -4,6 +4,13 @@ Runner-level tests use the REAL run_scenario()/_run_scripted() with app.db faked
 in-memory; transport-level tests drive the REAL native_ws transport over a fake socket
 (same fakes as test_run_scenario_native_ws.py), and unit-test each transport's
 read-only session_ended() helper.
+
+_run_scripted now passes every seed_turns line through _reactive_scripted_line, which
+calls chat() to react to the agent's actual last reply (see runner.py). The autouse
+fixture below stands chat() in with `fakes_llm.passthrough_chat`, which echoes the
+planned line straight back, so every "exact line" assertion below still holds for the
+same reason it always did — a real reactive rewrite is covered separately in
+test_run_scenario_flow_node.py.
 """
 import json
 from types import SimpleNamespace
@@ -13,6 +20,7 @@ import pytest
 from app.core import activities, runner, twilio_bridge, voice_caller
 from app.core import voice_native_ws as nws
 from app.core.node_script import path_script_to_scenario
+from tests.core.fakes_llm import passthrough_chat
 from tests.core.fakes_native_ws import FakeAsyncClient, FakeConnect, FakeWebSocket, turn_frame
 
 SENTINEL = runner._AGENT_ERROR_SENTINEL
@@ -48,11 +56,14 @@ def fake_db(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def no_generated_caller_text(monkeypatch):
+    """The AI Caller must never fire for a scripted scenario (still enforced); chat() IS
+    now used, by _reactive_scripted_line, but stood in with a deterministic passthrough
+    so these tests stay exact and network-free."""
     def boom(*a, **kw):
-        raise AssertionError("no caller text may be generated")
+        raise AssertionError("scripted flow scenario must not use the AI Caller")
 
     monkeypatch.setattr(runner, "next_utterance", boom)
-    monkeypatch.setattr(runner, "chat", boom)
+    monkeypatch.setattr(runner, "chat", passthrough_chat)
 
 
 @pytest.fixture(autouse=True)

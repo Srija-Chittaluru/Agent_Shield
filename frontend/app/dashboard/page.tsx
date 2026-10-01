@@ -90,9 +90,11 @@ const TEST_CATEGORIES = [
 // Test types used when an existing combination has no stored suite and we generate one.
 const defaultTypes = TEST_CATEGORIES.filter((c) => c.type !== "system_failure").map((c) => c.type);
 
-// How much of an uploaded doc we keep. Matches MAX_KNOWLEDGE_CHARS in
+// How much of the combined uploaded docs we keep. Matches MAX_KNOWLEDGE_CHARS in
 // backend/app/core/scenarios.py, so nothing is dropped silently on the way to the model.
 const MAX_KNOWLEDGE_CHARS = 60000;
+// How many Agent Knowledge documents can be uploaded at once.
+const MAX_KNOWLEDGE_DOCS = 2;
 
 const VERIFICATION_STEPS = [
   "Registering agent…",
@@ -308,32 +310,41 @@ export default function DashboardPage() {
   // that call (e.g. {"client": "acme"}), reusing endpoint_url as the HTTP base.
   const [voiceProtocol, setVoiceProtocol] = useState<"http_json" | "native_ws">("http_json");
   const [createCallBody, setCreateCallBody] = useState("");
-  // Knowledge source — all optional, combined: uploaded docs + uploaded YAML config +
+  // Knowledge source — all optional, combined: up to MAX_KNOWLEDGE_DOCS uploaded docs +
   // free-text about, any/all/none of them. Auto-discovery is the fallback if nothing
   // was given at all.
-  const [knowledgeText, setKnowledgeText] = useState("");
-  const [knowledgeFile, setKnowledgeFile] = useState("");
+  const [knowledgeDocs, setKnowledgeDocs] = useState<{ name: string; text: string }[]>([]);
   const [aboutText, setAboutText] = useState("");
   const [detected, setDetected] = useState(""); // description AgentShield auto-discovered
 
-  const onUpload = async (file: File | undefined) => {
-    if (!file) return;
+  const onUpload = async (fileList: FileList | null) => {
+    if (!fileList || fileList.length === 0) return;
+    const room = MAX_KNOWLEDGE_DOCS - knowledgeDocs.length;
+    const files = Array.from(fileList).slice(0, room);
+    if (fileList.length > room) {
+      setError(`You can upload at most ${MAX_KNOWLEDGE_DOCS} documents — only the first ${room} of those were added.`);
+    }
     try {
-      const text = await file.text();
-      setKnowledgeText(text.slice(0, MAX_KNOWLEDGE_CHARS));
-      setKnowledgeFile(file.name);
+      const read = await Promise.all(files.map(async (f) => ({ name: f.name, text: await f.text() })));
+      setKnowledgeDocs((prev) => [...prev, ...read]);
     } catch {
       setError("Couldn't read that file — please use a text/markdown file.");
     }
   };
-  const clearUpload = () => { setKnowledgeText(""); setKnowledgeFile(""); };
+  const removeKnowledgeDoc = (i: number) => setKnowledgeDocs((prev) => prev.filter((_, idx) => idx !== i));
 
-  // What gets sent as "knowledge" to the backend. Kept as its own name (rather than
-  // renaming every call site to knowledgeText/knowledgeFile) — there is no separate
-  // YAML-as-knowledge upload here: a Voice Agent's flow definition is a different
-  // concept, uploaded separately under Flow-Based Scripts after connecting.
-  const combinedKnowledgeText = knowledgeText;
-  const combinedKnowledgeName = knowledgeFile;
+  // What gets sent as "knowledge" to the backend: every uploaded doc's text, each
+  // clearly headed by its filename, joined into the one text/name pair the existing
+  // POST /agents/{id}/knowledge already accepts (storage stays a single text column —
+  // see backend/app/db.py — so multiple docs are combined client-side, not stored
+  // separately). There is no separate YAML-as-knowledge upload here: a Voice Agent's
+  // flow definition is a different concept, uploaded separately under Flow-Based
+  // Scripts after connecting.
+  const combinedKnowledgeText = knowledgeDocs
+    .map((d) => `=== ${d.name} ===\n${d.text}`)
+    .join("\n\n")
+    .slice(0, MAX_KNOWLEDGE_CHARS);
+  const combinedKnowledgeName = knowledgeDocs.map((d) => d.name).join(", ");
   // Agent Knowledge is required (both modalities) — satisfied by EITHER an uploaded
   // doc or a non-empty description, never both.
   const hasKnowledge = combinedKnowledgeText.trim().length > 0 || aboutText.trim().length > 0;
@@ -501,8 +512,7 @@ export default function DashboardPage() {
     setApiKey("");
     setVoiceProtocol("http_json");
     setCreateCallBody("");
-    setKnowledgeText("");
-    setKnowledgeFile("");
+    setKnowledgeDocs([]);
     setAboutText("");
     setDetected("");
     setSelectedTests(TEST_CATEGORIES.filter((c) => c.type !== "system_failure").map((c) => c.label));
@@ -1153,27 +1163,40 @@ export default function DashboardPage() {
                     </p>
 
                     {/* Satisfied by EITHER this upload OR the description below. */}
-                    {!knowledgeFile ? (
-                      <label className="mt-2 flex cursor-pointer items-center gap-3 rounded-lg border border-dashed border-white/20 bg-white/2 px-4 py-4 text-sm text-slate-400 transition-colors hover:border-white/40 hover:text-[#F8FAFC]">
-                        <Upload className="h-5 w-5 shrink-0" strokeWidth={1.5} />
-                        <span>Upload the agent&apos;s docs / knowledge base <span className="text-slate-600">(.md, .txt, .json — best results)</span></span>
-                        <input
-                          type="file"
-                          accept=".md,.txt,.json,.csv,.text"
-                          className="hidden"
-                          onChange={(e) => onUpload(e.target.files?.[0])}
-                        />
-                      </label>
-                    ) : (
-                      <div className="mt-2 flex items-center gap-3 rounded-lg border border-[#34D399]/30 bg-[#34D399]/[0.06] px-4 py-3 text-sm">
-                        <FileText className="h-5 w-5 shrink-0 text-[#34D399]" strokeWidth={1.5} />
-                        <span className="flex-1 truncate text-[#F8FAFC]">{knowledgeFile}</span>
-                        <span className="text-xs text-slate-500">{knowledgeText.length.toLocaleString()} chars</span>
-                        <button onClick={clearUpload} className="text-slate-400 hover:text-[#F87171]"><X className="h-4 w-4" /></button>
+                    {knowledgeDocs.length > 0 && (
+                      <div className="mt-2 space-y-2">
+                        {knowledgeDocs.map((doc, i) => (
+                          <div key={`${doc.name}-${i}`} className="flex items-center gap-3 rounded-lg border border-[#34D399]/30 bg-[#34D399]/[0.06] px-4 py-3 text-sm">
+                            <FileText className="h-5 w-5 shrink-0 text-[#34D399]" strokeWidth={1.5} />
+                            <span className="flex-1 truncate text-[#F8FAFC]">{doc.name}</span>
+                            <span className="text-xs text-slate-500">{doc.text.length.toLocaleString()} chars</span>
+                            <button onClick={() => removeKnowledgeDoc(i)} className="text-slate-400 hover:text-[#F87171]"><X className="h-4 w-4" /></button>
+                          </div>
+                        ))}
                       </div>
                     )}
 
-                    {!knowledgeFile && (
+                    {knowledgeDocs.length < MAX_KNOWLEDGE_DOCS && (
+                      <label className="mt-2 flex cursor-pointer items-center gap-3 rounded-lg border border-dashed border-white/20 bg-white/2 px-4 py-4 text-sm text-slate-400 transition-colors hover:border-white/40 hover:text-[#F8FAFC]">
+                        <Upload className="h-5 w-5 shrink-0" strokeWidth={1.5} />
+                        <span>
+                          {knowledgeDocs.length === 0 ? (
+                            <>Upload the agent&apos;s docs / knowledge base <span className="text-slate-600">(.md, .txt, .json — best results, up to {MAX_KNOWLEDGE_DOCS} files)</span></>
+                          ) : (
+                            <>Add another document <span className="text-slate-600">({MAX_KNOWLEDGE_DOCS - knowledgeDocs.length} more allowed)</span></>
+                          )}
+                        </span>
+                        <input
+                          type="file"
+                          accept=".md,.txt,.json,.csv,.text"
+                          multiple
+                          className="hidden"
+                          onChange={(e) => { onUpload(e.target.files); e.target.value = ""; }}
+                        />
+                      </label>
+                    )}
+
+                    {knowledgeDocs.length === 0 && (
                       <textarea
                         value={aboutText}
                         onChange={(e) => setAboutText(e.target.value)}

@@ -8,7 +8,13 @@ scenario (see run_scenario()):
   existed, and any newly generated one that omits it) — _run_scripted() plays
   scenario["seed_turns"] in fixed order, with a semi-adaptive follow-up for
   injection/memory/contradiction scenarios that under-filled their pressing turn.
-  Unchanged from before the AI Caller existed.
+  Unchanged from before the AI Caller existed, EXCEPT for a flow-authored scripted
+  voice test (test_type in AGENT_FIRST_SCRIPTED_TYPES — see _reactive_scripted_line):
+  each seed_turns line is a caller_line written OFFLINE against an anticipated agent
+  question (app.core.node_script), so once the real agent's actual last reply is
+  known, that line is rephrased to actually answer it rather than spoken verbatim —
+  a real agent that clarifies, asks to hold, or re-asks a question would otherwise
+  get a non-sequitur answer written for a question it never asked.
 
   DYNAMIC (scenario["customer_context"] non-empty) — _run_dynamic() has
   app.core.ai_caller generate ONE natural next utterance per turn, reacting to the
@@ -94,6 +100,70 @@ async def _adaptive_followup(scenario: dict, transcript: list[dict]) -> str | No
         return PRESS_TURNS.get(scenario["test_type"])
 
 
+async def _reactive_scripted_line(intended_line: str, transcript: list[dict]) -> str:
+    """Rephrase one flow-authored seed_turns line to actually react to the agent's real
+    last reply, instead of speaking it verbatim.
+
+    A flow-authored caller_line (app.core.node_script) is written OFFLINE against an
+    ANTICIPATED agent question — but a real agent can clarify, ask to hold, re-ask a
+    question, or otherwise diverge from what was anticipated. Speaking the scripted
+    line verbatim in that case reads as a non-sequitur (e.g. the agent asks "may I
+    speak with Daniel?" and the scripted line answers an unrelated question about a
+    mailed packet). This asks an LLM for the one thing the caller would actually say
+    next: it must directly answer what the agent JUST said, using the scripted line's
+    content where that content genuinely fits, and otherwise giving a short, natural,
+    cooperative reply that keeps the call moving toward it.
+
+    Returns `intended_line` unchanged on any failure (LLM error, malformed json, empty
+    result) or when `transcript` is empty (nothing to react to yet — the caller is
+    opening cold), so the scripted scenario still runs even if this call fails.
+    """
+    if not transcript:
+        return intended_line
+    system = (
+        "You are simulating a REAL CUSTOMER on a phone call, following a pre-planned "
+        "test script. You have ONE planned next line you intended to say, but the "
+        "agent you're actually talking to may not have asked what was expected — a "
+        "real agent decides what to ask, not the script. Given the conversation so "
+        "far (the agent's actual words) and your planned line, write the ONE thing "
+        "you'd actually say next: it must directly and sensibly respond to what the "
+        "agent JUST said (answer a yes/no question, respond to a request to hold or "
+        "to speak with someone, etc.) — never a non-sequitur.\n\n"
+        "Only use your planned line's content if it answers the SAME question or "
+        "topic the agent just raised. Matching yes/no polarity is NOT enough on its "
+        "own — check the actual subject matter. For example, if the agent asks 'may "
+        "I speak with Daniel?' and your planned line is 'No, I haven't sent it back "
+        "yet' (about an unrelated mailed packet), that does NOT answer the agent's "
+        "question just because it starts with a yes/no word — say something that "
+        "actually answers about Daniel instead, e.g. 'Speaking' or 'He's not "
+        "available right now.' The same applies to a greeting/scheduling question "
+        "like 'do you have a couple of minutes?': answer THAT, don't reach for an "
+        "unrelated fact that happens to also start with 'yes'.\n\n"
+        "If the agent asked something your planned line doesn't actually address, "
+        "give a short, natural, cooperative reply that keeps the call moving — you "
+        "can still deliver your planned line's content once the agent actually asks "
+        "for it. Stay in character as the customer for your entire reply; never "
+        "mention a script, a test, or that you are an AI. Respond in json: "
+        "{\"line\": \"...\"}."
+    )
+    convo = "\n".join(f"{m['role']}: {m['content']}" for m in transcript)
+    try:
+        result = await chat(
+            system=system,
+            messages=[{
+                "role": "user",
+                "content": f"CONVERSATION SO FAR:\n{convo}\n\n"
+                           f"YOUR PLANNED NEXT LINE: {intended_line}\n\n"
+                           "Write what you'd actually say next, as json.",
+            }],
+            json_mode=True,
+        )
+        line = result.get("line") if isinstance(result, dict) else None
+        return str(line).strip() if line else intended_line
+    except Exception:
+        return intended_line
+
+
 async def _run_scripted(
     conv_id: int,
     scenario: dict,
@@ -106,19 +176,22 @@ async def _run_scripted(
 ) -> None:
     """Play scenario["seed_turns"] in fixed order. Unchanged from before dynamic mode
     existed — every pre-existing scenario (customer_context empty) still runs exactly
-    this path, EXCEPT for two narrowly-scoped additions below, both keyed on test_type:
+    this path, EXCEPT for three narrowly-scoped additions below, all keyed on test_type:
 
     - a flow-authored scripted voice test (test_type in AGENT_FIRST_SCRIPTED_TYPES:
       "flow_node" or "flow_path" — see app.core.node_script) drains the Voice Agent's
       unprompted opening greeting first, exactly like _run_dynamic already does for the
       AI Caller;
+    - the same flow-authored scripted tests have each seed_turns line passed through
+      _reactive_scripted_line before it's spoken, so it answers what the agent actually
+      just said rather than the question it was written against (see that function);
     - a flow scenario ("flow_path") plays ALL of its seed_turns rather than stopping at
       MAX_TESTER_TURNS — but stops as soon as its voice session has ended (the agent
       hung up, or the call died), asking `session_ended_fn` after each agent turn. The
       transcript then holds only turns that actually happened: nothing is sent into a
       dead call, and no string of repeated transport errors is recorded.
 
-    Every other scripted scenario takes both checks to False and runs byte-for-byte as
+    Every other scripted scenario takes every check to False and runs byte-for-byte as
     before.
 
     Why this was needed: a flow-node script's seed_turns are the CALLER's fixed lines
@@ -140,13 +213,10 @@ async def _run_scripted(
     # its own length (still finite — the loop never outruns seed_turns, and flow_path
     # never gets an adaptive follow-up). Every other scenario keeps MAX_TESTER_TURNS.
     is_flow_path = scenario.get("test_type") == PATH_TEST_TYPE
+    is_agent_first_scripted = scenario.get("test_type") in AGENT_FIRST_SCRIPTED_TYPES
     max_tester_turns = len(seed_turns) if is_flow_path else MAX_TESTER_TURNS
 
-    if (
-        custom_send_fn
-        and greeting_fn is not None
-        and scenario.get("test_type") in AGENT_FIRST_SCRIPTED_TYPES
-    ):
+    if custom_send_fn and greeting_fn is not None and is_agent_first_scripted:
         try:
             greeting = await greeting_fn(agent, conv_id)
         except Exception as e:
@@ -179,7 +249,11 @@ async def _run_scripted(
 
     i = 0
     while i < len(seed_turns) and tester_turns_played < max_tester_turns:
-        tester_msg = seed_turns[i]
+        intended_line = seed_turns[i]
+        if is_agent_first_scripted:
+            tester_msg = await _reactive_scripted_line(intended_line, transcript)
+        else:
+            tester_msg = intended_line
 
         # --- tester turn ---
         insert_message(conv_id, turn_index, "tester", tester_msg, None)

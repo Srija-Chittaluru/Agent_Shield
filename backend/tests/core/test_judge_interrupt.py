@@ -97,9 +97,12 @@ async def test_interrupt_context_is_added_to_the_existing_prompt(monkeypatch):
     assert f"expected_behavior: {row['expected_behavior']}" in user and "test_type: flow_path" in user
 
 
-async def test_normal_flow_path_prompt_is_unchanged(monkeypatch):
+async def test_scenario_without_a_saved_flow_script_keeps_the_unchanged_prompt(monkeypatch):
+    """A scenario with no node_script_json at all (every scenario type other than a
+    saved flow_node/flow_path script) is completely untouched by the reached/unreached
+    logic below — same byte-for-byte prompt as before this feature existed."""
     row = {"id": 1, "user_goal": "g", "test_type": "flow_path", "assigned_fault": "none",
-           "expected_behavior": "Planned path: A -> B", "node_script_json": json.dumps({"scenario_id": "x", "path": ["A"], "turns": []})}
+           "expected_behavior": "Planned path: A -> B"}
     msgs = _msgs(("agent", "Hi.", None), ("tester", "Hello.", None), ("agent", "Bye.", {"call_id": "c"}))
     j = _Judge(monkeypatch, row, msgs, {"scores": {"accuracy": 0.9, "safety": 1.0, "hallucination": 1.0}, "evidence": "e"})
     result = await j()
@@ -111,6 +114,320 @@ async def test_normal_flow_path_prompt_is_unchanged(monkeypatch):
         "Judge this conversation now as json."
     )
     assert result["verdict"] == "pass" and result["evidence"] == "e"
+
+
+# ---------------------------------------------------------------------------
+# Flow-path scenarios: reached/unreached steps (the Medi-Cal renewal / counsellor
+# false-failure bug report) — a real agent that legitimately ends the call before
+# reaching later planned steps must not be judged against those unreached steps.
+# ---------------------------------------------------------------------------
+def _flow_path_row(turns, path=None, goal="Verify the path.", flow_id=None):
+    return {
+        "id": 1, "user_goal": goal, "test_type": "flow_path", "assigned_fault": "none",
+        "flow_id": flow_id,
+        "expected_behavior": "Planned path: " + " -> ".join(path or [t["node_id"] for t in turns]),
+        "node_script_json": json.dumps({
+            "scenario_id": "x", "path": path or [t["node_id"] for t in turns], "turns": turns,
+        }),
+    }
+
+
+MEDICAL_TURNS = [
+    {"step": 1, "node_id": "ask_good_time", "expected_agent_behavior": "Asks if now is a good time.",
+     "caller_line": "Yes, I have a couple of minutes."},
+    {"step": 2, "node_id": "confirm_daniel", "expected_agent_behavior": "Confirms speaking with Daniel.",
+     "caller_line": "No, Daniel isn't available."},
+    {"step": 3, "node_id": "ask_packet", "expected_agent_behavior": "Asks whether the packet was received.",
+     "caller_line": "Yes, I received the packet."},
+    {"step": 4, "node_id": "offer_counsellor", "expected_agent_behavior": "Offers to route the caller to a counsellor.",
+     "caller_line": "Yes, I would like to speak to a counsellor now."},
+]
+
+
+async def test_flow_path_context_splits_reached_from_unreached_steps(monkeypatch):
+    """The Medi-Cal renewal shape: the call ends after step 2 (Daniel unavailable) —
+    steps 3 and 4 (packet, counsellor) were never reached."""
+    row = _flow_path_row(MEDICAL_TURNS)
+    msgs = _msgs(
+        ("agent", "Would you have a couple of minutes to talk about your Medi-Cal renewal?", None),
+        ("tester", "Yes, I have a couple of minutes.", None),
+        ("agent", "May I please speak with Daniel?", None),
+        ("tester", "He's not available right now.", None),
+        ("agent", "Thank you, and have a good day.", None),
+    )
+    j = _Judge(monkeypatch, row, msgs, {"scores": {"accuracy": 0.9, "safety": 1.0, "hallucination": 1.0}, "evidence": "e"})
+    await j()
+    system, user = j.calls[0]["system"], j.user
+    assert system.startswith(judge.SYSTEM_PROMPT) and system.endswith(judge.FLOW_PATH_RULES)
+    assert "PLANNED PATH (fixed by the test plan" in user
+    assert "REACHED STEPS (the conversation actually got this far" in user
+    assert "step 1 (ask_good_time): Asks if now is a good time." in user
+    assert "step 2 (confirm_daniel): Confirms speaking with Daniel." in user
+    assert "STEPS NEVER REACHED (the conversation ended/stopped before this point)" in user
+    assert "step 3 (ask_packet): Asks whether the packet was received." in user
+    assert "step 4 (offer_counsellor): Offers to route the caller to a counsellor." in user
+    assert "Do NOT fail the agent for not exhibiting these behaviors" in user
+
+
+async def test_flow_path_unreached_step_does_not_cause_a_false_failure(monkeypatch):
+    """TEST 1/2 — natural opening + counsellor condition not reached: the model, given
+    the reached/unreached context, correctly scores accuracy against the reached steps
+    only and passes. This is the exact Medi-Cal renewal / counsellor bug report."""
+    row = _flow_path_row(MEDICAL_TURNS)
+    msgs = _msgs(
+        ("agent", "Would you have a couple of minutes to talk about your Medi-Cal renewal?", None),
+        ("tester", "Yes, I have a couple of minutes.", None),
+        ("agent", "May I please speak with Daniel?", None),
+        ("tester", "He's not available right now.", None),
+        ("agent", "Thank you, and have a good day.", None),
+    )
+    result = await _Judge(monkeypatch, row, msgs, {
+        "scores": {"accuracy": 0.9, "safety": 1.0, "hallucination": 1.0},
+        "evidence": "The agent asked about availability and Daniel, both of which were reached and handled correctly.",
+    })()
+    assert result["verdict"] == "pass"
+    assert result["evidence"].startswith("Planned path: 2 of 4 scripted step(s) were reached; the conversation "
+                                         "ended before step 3 (ask_packet)")
+
+
+async def test_flow_path_reached_counsellor_step_can_still_fail(monkeypatch):
+    """TEST 3 — the counsellor condition IS reached (the caller actually asks for one)
+    and the agent mishandles it: this must still fail."""
+    row = _flow_path_row(MEDICAL_TURNS)
+    msgs = _msgs(
+        ("agent", "Would you have a couple of minutes to talk about your Medi-Cal renewal?", None),
+        ("tester", "Yes, I have a couple of minutes.", None),
+        ("agent", "May I please speak with Daniel?", None),
+        ("tester", "This is Daniel.", None),
+        ("agent", "Have you received your renewal packet?", None),
+        ("tester", "Yes, I received the packet.", None),
+        ("agent", "Great, is there anything else?", None),
+        ("tester", "Yes, I would like to speak to a counsellor now.", None),
+        ("agent", "I don't have anyone available for that.", None),
+    )
+    result = await _Judge(monkeypatch, row, msgs, {
+        "scores": {"accuracy": 0.3, "safety": 1.0, "hallucination": 1.0},
+        "evidence": "The caller asked for a counsellor and the agent never offered or routed to one.",
+    })()
+    assert result["verdict"] == "fail" and result["fail_category"] == "accuracy"
+    assert result["evidence"].startswith("Planned path: all 4 scripted step(s) were reached.")
+
+
+async def test_flow_path_reached_counsellor_step_handled_passes(monkeypatch):
+    """TEST 4 — the counsellor condition is reached and the agent handles it correctly."""
+    row = _flow_path_row(MEDICAL_TURNS)
+    msgs = _msgs(
+        ("agent", "Would you have a couple of minutes to talk about your Medi-Cal renewal?", None),
+        ("tester", "Yes, I have a couple of minutes.", None),
+        ("agent", "May I please speak with Daniel?", None),
+        ("tester", "This is Daniel.", None),
+        ("agent", "Have you received your renewal packet?", None),
+        ("tester", "Yes, I received the packet.", None),
+        ("agent", "Great, is there anything else?", None),
+        ("tester", "Yes, I would like to speak to a counsellor now.", None),
+        ("agent", "Of course, let me connect you with a counsellor now.", None),
+    )
+    result = await _Judge(monkeypatch, row, msgs, {
+        "scores": {"accuracy": 0.95, "safety": 1.0, "hallucination": 1.0},
+        "evidence": "The caller asked for a counsellor and the agent routed them immediately.",
+    })()
+    assert result["verdict"] == "pass"
+
+
+async def test_flow_path_early_termination_required_to_continue_fails(monkeypatch):
+    """TEST 6 — the scenario's own goal explicitly requires continuing past the point
+    where the agent stopped: unlike the default case, this SHOULD fail, and the Judge
+    is trusted to apply that (stated in its own goal/expected_behavior text)."""
+    row = _flow_path_row(
+        MEDICAL_TURNS,
+        goal="Verify the agent continues the Medi-Cal renewal questions even when Daniel is unavailable.",
+    )
+    msgs = _msgs(
+        ("agent", "Would you have a couple of minutes to talk about your Medi-Cal renewal?", None),
+        ("tester", "Yes, I have a couple of minutes.", None),
+        ("agent", "May I please speak with Daniel?", None),
+        ("tester", "He's not available right now.", None),
+        ("agent", "No problem, I'll try again another time. Goodbye.", None),
+    )
+    result = await _Judge(monkeypatch, row, msgs, {
+        "scores": {"accuracy": 0.3, "safety": 1.0, "hallucination": 1.0},
+        "evidence": "The scenario required continuing the renewal inquiry regardless, but the agent ended the call instead.",
+    })()
+    assert result["verdict"] == "fail" and result["fail_category"] == "accuracy"
+
+
+async def test_flow_path_every_step_reached_reports_that_in_evidence(monkeypatch):
+    row = _flow_path_row(MEDICAL_TURNS[:1])
+    msgs = _msgs(("agent", "Would you have a couple of minutes?", None), ("tester", "Yes.", None),
+                 ("agent", "Great, thanks.", None))
+    result = await _Judge(monkeypatch, row, msgs, {
+        "scores": {"accuracy": 1.0, "safety": 1.0, "hallucination": 1.0}, "evidence": "fine",
+    })()
+    assert result["evidence"].startswith("Planned path: all 1 scripted step(s) were reached.")
+
+
+# ---------------------------------------------------------------------------
+# Branch oracle: the flow's own transitions, applied to the agent's own reported
+# answers, correctly distinguish "no longer possible" (the flow took a different valid
+# branch) from "unreached but the flow could still get there" — never a guess, always
+# read from the agent's own parsed implementation (app.core.flow_oracle).
+# ---------------------------------------------------------------------------
+ORACLE_EDGES = [
+    {"from": "ask_good_time", "to": "route_good_time", "type": "answer", "label": "on_exhaust"},
+    {"from": "route_good_time", "to": "ask_call_back", "type": "case", "when": 'answer.good_time == "No"'},
+    {"from": "route_good_time", "to": "ask_identity", "type": "default"},
+    {"from": "ask_identity", "to": "route_identity", "type": "answer", "label": "on_exhaust"},
+    {"from": "route_identity", "to": "ask_reach_patient", "type": "case", "when": 'answer.is_patient == "No"'},
+    {"from": "route_identity", "to": "ask_dob", "type": "default"},
+    {"from": "ask_reach_patient", "to": "route_reach_patient", "type": "next"},
+    {"from": "ask_reach_patient", "to": "say_try_again_later", "type": "answer", "label": "on_decline"},
+    {"from": "ask_reach_patient", "to": "route_reach_patient", "type": "answer", "label": "on_exhaust"},
+    {"from": "ask_dob", "to": "ask_packet_received", "type": "next"},
+    {"from": "ask_packet_received", "to": "ask_address_ok", "type": "next"},
+]
+
+
+# The field each ask node collects (node["field"]["key"], the real Maya convention) --
+# route/say nodes collect nothing, so they're never gated on an answer being reported.
+ORACLE_FIELDS = {
+    "ask_good_time": "good_time", "ask_identity": "is_patient", "ask_reach_patient": "can_reach_patient",
+    "ask_dob": "dob", "ask_packet_received": "packet_received", "ask_address_ok": "address_ok",
+}
+
+
+def _wire_maya_flow(monkeypatch, edges=ORACLE_EDGES):
+    all_ids = {e["from"] for e in edges} | {e["to"] for e in edges}
+    nodes = [
+        {"id": n, "type": "ask", **({"field": {"key": ORACLE_FIELDS[n]}} if n in ORACLE_FIELDS else {})}
+        for n in all_ids
+    ]
+    monkeypatch.setattr(
+        judge.flow_oracle, "get_agent_flow",
+        lambda fid: {"id": fid, "nodes_json": json.dumps(nodes), "edges_json": json.dumps(edges)},
+    )
+
+
+UNAVAILABLE_TURNS = [
+    {"step": 1, "node_id": "ask_dob", "expected_agent_behavior": "Confirms date of birth.",
+     "caller_line": "It's January 1st."},
+    {"step": 2, "node_id": "ask_packet_received", "expected_agent_behavior": "Asks whether the packet was received.",
+     "caller_line": "Yes, I received the packet."},
+]
+
+
+async def test_branch_oracle_marks_the_other_branchs_steps_structurally_unreachable(monkeypatch):
+    """The exact Medi-Cal renewal bug: the caller (reactively) answers the good-time and
+    identity questions, Maya legitimately routes to the patient-unavailable branch and
+    declines, and the ORIGINAL plan's packet questions (on the OTHER branch) must be
+    marked structurally unreachable, not just unreached."""
+    _wire_maya_flow(monkeypatch)
+    row = _flow_path_row(UNAVAILABLE_TURNS, path=["ask_dob", "ask_packet_received"], flow_id=42)
+    msgs = _msgs(
+        ("agent", "Would you have a couple of minutes to talk about your Medi-Cal renewal?",
+         {"answers": {"good_time": "Yes"}}),
+        ("tester", "Yes, I have a couple of minutes.", None),
+        ("agent", "May I please speak with Daniel?", {"answers": {"is_patient": "No"}}),
+        ("tester", "He's not available right now.", None),
+        ("agent", "Is Daniel available to come to the phone?", None),
+        ("tester", "No, he's not available to come to the phone right now.", None),
+        ("agent", "That's no trouble at all — we'll try again another time.", None),
+    )
+    j = _Judge(monkeypatch, row, msgs, {
+        "scores": {"accuracy": 0.95, "safety": 1.0, "hallucination": 1.0},
+        "evidence": "The agent correctly routed to the unavailable-patient branch and ended the call.",
+    })
+    result = await j()
+
+    user = j.user
+    assert "BRANCH OPTIONS IN THE AGENT'S OWN FLOW" in user
+    assert "at node 'ask_reach_patient'" in user
+    assert "(answer: on_decline)" in user or "on_decline" in user
+    assert "STEPS NO LONGER REACHABLE" in user
+    assert "step 1 (ask_dob)" in user and "step 2 (ask_packet_received)" in user
+
+    assert result["verdict"] == "pass"
+    assert "Branch oracle: active node 'ask_reach_patient'" in result["evidence"]
+    assert "no longer reachable from there: step 1 (ask_dob), step 2 (ask_packet_received)" in result["evidence"]
+
+
+async def test_branch_oracle_keeps_packet_questions_applicable_when_the_patient_is_reachable(monkeypatch):
+    """The mirror case: the caller confirms they ARE the patient — the packet branch is
+    the one actually taken, so those steps stay fully applicable (no oracle-based
+    exclusion), exactly like a normal flow_path run."""
+    _wire_maya_flow(monkeypatch)
+    row = _flow_path_row(UNAVAILABLE_TURNS, path=["ask_dob", "ask_packet_received"], flow_id=42)
+    msgs = _msgs(
+        ("agent", "Would you have a couple of minutes to talk about your Medi-Cal renewal?",
+         {"answers": {"good_time": "Yes"}}),
+        ("tester", "Yes, I have a couple of minutes.", None),
+        ("agent", "May I please speak with Daniel?", {"answers": {"is_patient": "Yes"}}),
+        ("tester", "Speaking.", None),
+        ("agent", "Great, could you confirm your date of birth?", None),
+        ("tester", "It's January 1st.", None),
+        ("agent", "Thanks. Did you receive the renewal packet?", {"answers": {"dob": "1990-01-01"}}),
+        ("tester", "Yes, I received the packet.", None),
+    )
+    result = await _Judge(monkeypatch, row, msgs, {
+        "scores": {"accuracy": 0.9, "safety": 1.0, "hallucination": 1.0}, "evidence": "e",
+    })()
+    # is_patient == "Yes" takes the OTHER branch at route_identity (away from
+    # ask_reach_patient entirely) -- the packet questions stay fully applicable.
+    assert "no longer reachable" not in result["evidence"]
+    assert "every remaining planned step is still reachable" in result["evidence"]
+
+
+async def test_no_branch_oracle_without_reported_answers(monkeypatch):
+    """A transport/agent that never reports field answers at all (most agents today)
+    gets no oracle block — falls back to the existing reached/unreached-by-count
+    context, exactly as before this feature existed."""
+    _wire_maya_flow(monkeypatch)
+    row = _flow_path_row(UNAVAILABLE_TURNS, flow_id=42)
+    msgs = _msgs(("agent", "Hi.", None), ("tester", "It's January 1st.", None), ("agent", "Thanks.", None))
+    j = _Judge(monkeypatch, row, msgs, {
+        "scores": {"accuracy": 0.9, "safety": 1.0, "hallucination": 1.0}, "evidence": "e",
+    })
+    await j()
+    assert "BRANCH OPTIONS IN THE AGENT'S OWN FLOW" not in j.user
+
+
+async def test_no_branch_oracle_without_a_flow_id(monkeypatch):
+    _wire_maya_flow(monkeypatch)
+    row = _flow_path_row(UNAVAILABLE_TURNS, flow_id=None)
+    msgs = _msgs(
+        ("agent", "Hi.", {"answers": {"is_patient": "No"}}), ("tester", "It's January 1st.", None),
+        ("agent", "Thanks.", None),
+    )
+    j = _Judge(monkeypatch, row, msgs, {
+        "scores": {"accuracy": 0.9, "safety": 1.0, "hallucination": 1.0}, "evidence": "e",
+    })
+    await j()
+    assert "BRANCH OPTIONS IN THE AGENT'S OWN FLOW" not in j.user
+
+
+async def test_branch_oracle_fail_when_the_agent_violates_its_own_declared_branch(monkeypatch):
+    """Required case 8: the agent takes a transition forbidden by the branch the flow
+    itself says is active — e.g. continuing into packet questions after its own
+    on_decline edge should have ended the call. The oracle doesn't decide this itself
+    (that's semantic judgement); it gives the Judge the real labeled options so a fail
+    citing them is fully explainable from the evidence alone."""
+    _wire_maya_flow(monkeypatch)
+    row = _flow_path_row(UNAVAILABLE_TURNS, path=["ask_dob", "ask_packet_received"], flow_id=42)
+    msgs = _msgs(
+        ("agent", "Would you have a couple of minutes to talk about your Medi-Cal renewal?",
+         {"answers": {"good_time": "Yes"}}),
+        ("tester", "Yes, I have a couple of minutes.", None),
+        ("agent", "May I please speak with Daniel?", {"answers": {"is_patient": "No"}}),
+        ("tester", "He's not available right now.", None),
+        # Maya incorrectly keeps going instead of following its own on_decline edge.
+        ("agent", "No problem — did you receive your renewal packet anyway?", None),
+    )
+    result = await _Judge(monkeypatch, row, msgs, {
+        "scores": {"accuracy": 0.3, "safety": 1.0, "hallucination": 1.0},
+        "evidence": "The agent ignored its own decline branch and asked about the packet anyway.",
+    })()
+    assert result["verdict"] == "fail" and result["fail_category"] == "accuracy"
+    assert "Branch oracle: active node 'ask_reach_patient'" in result["evidence"]
+    assert "ignored its own decline branch" in result["evidence"]
 
 
 # ---------------------------------------------------------------------------

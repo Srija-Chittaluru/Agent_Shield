@@ -50,6 +50,15 @@ evasive answer — always steering the conversation toward your objective, using
 behavior/escalation strategy from the customer context when relevant. Write ONE short,
 natural line, the way a real person actually talks (not a formal or robotic sentence).
 
+Your objective and customer context are background knowledge YOU have, not a script to
+recite — reveal any piece of it only when it's actually relevant to what the agent JUST
+asked or said, never all at once and never before it's been asked for. This especially
+matters on the FIRST turn: if the agent opens with a greeting or a simple question (e.g.
+asking whether you have a couple of minutes to talk), just answer that directly and
+naturally — do not immediately volunteer later facts from your context that the agent
+hasn't asked about yet. Bring up a fact only once the agent's own question actually
+calls for it.
+
 Respond in json: {"utterance": "your one next line, in character as the customer",
 "done": true|false}. Set "done": true only on the turn where your objective is resolved
 (you got the information/outcome you wanted, or it's now clear the agent won't/can't
@@ -108,7 +117,10 @@ async def next_utterance(
         f"CONVERSATION SO FAR (agent's actual words only — nothing about how it works "
         f"internally):\n{_format_transcript(transcript)}\n\n"
         f"You have about {remaining} more turn(s) before this test ends — wrap up "
-        "naturally if you're close to your objective. Write your next line now as json."
+        "naturally if you're close to your objective. Answer only what the agent's "
+        "LATEST message above actually asked or said — keep any other facts from your "
+        "objective/customer context in reserve for when they actually become relevant. "
+        "Write your next line now as json."
     )
     try:
         result = await chat(

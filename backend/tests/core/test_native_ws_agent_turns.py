@@ -16,6 +16,7 @@ import pytest
 from app.core import runner, voice_caller
 from app.core import voice_native_ws as nws
 from app.core.node_script import path_script_to_scenario
+from tests.core.fakes_llm import passthrough_chat
 from tests.core.fakes_native_ws import FakeAsyncClient, FakeConnect, turn_frame
 from tests.core.test_run_scenario_session_end import fake_db  # noqa: F401  (fixture)
 
@@ -29,6 +30,14 @@ def fast_settle(monkeypatch):
     monkeypatch.setattr(nws, "AUDIO_QUIET_S", 0.1)
     monkeypatch.setattr(nws, "SPEAKING_MAX_S", 2.0)
     monkeypatch.setattr(nws, "MAX_OUTPUT_S", 5.0)
+
+
+@pytest.fixture(autouse=True)
+def deterministic_chat(monkeypatch):
+    # _run_scripted's _reactive_scripted_line calls chat() to react to the agent's
+    # actual last reply (see runner.py) — stood in with a deterministic passthrough so
+    # these turn-synchronization tests stay exact and network-free.
+    monkeypatch.setattr(runner, "chat", passthrough_chat)
 
 
 @pytest.fixture(autouse=True)

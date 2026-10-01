@@ -485,6 +485,32 @@ async def generate_path_script(
 PATH_TEST_TYPE = "flow_path"
 
 
+def parse_plain_path_script(node_script_json: Optional[str]) -> Optional[dict]:
+    """The saved PLAIN (non-interrupt) flow-path script — {"scenario_id", "path",
+    "turns"}, turns being {"step","node_id","expected_agent_behavior","caller_line"} —
+    see path_script_to_scenario. None for every other scenario, including an interrupt
+    scenario (its node_script_json carries "kind": "interrupt" — see
+    interrupt_script_to_scenario) and a flow_node script (to_scenario_dict has no
+    "path"/"turns" wrapper at all).
+
+    Shared by app.core.runner (to attach each scripted caller turn's node_id/step as
+    deterministic trace metadata) and app.core.judge (to derive its branch oracle) —
+    one parser for the one saved shape both need to read.
+    """
+    try:
+        script = json.loads(node_script_json or "null")
+    except (TypeError, ValueError):
+        return None
+    if (
+        isinstance(script, dict)
+        and script.get("kind") != "interrupt"
+        and isinstance(script.get("turns"), list)
+        and isinstance(script.get("path"), list)
+    ):
+        return script
+    return None
+
+
 def path_script_to_scenario(
     flow_id: int, scenario_id: str, name: str, path: list[str], node_names: dict[str, str],
     test_goal: str, turns: list[dict],

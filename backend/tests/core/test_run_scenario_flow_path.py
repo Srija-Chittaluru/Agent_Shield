@@ -5,12 +5,20 @@ scripted scenario keeps the 5-turn cap.
 Same faking approach as test_run_scenario_flow_node.py: app.db is faked in-memory and
 send_fn/greeting_fn are scripted test doubles. One test drives the REAL native_ws
 transport (fake socket only) to show the existing greeting handling is what's used.
+
+_run_scripted now passes every seed_turns line through _reactive_scripted_line, which
+calls chat() to react to the agent's actual last reply (see runner.py). The autouse
+fixture below stands chat() in with `fakes_llm.passthrough_chat`, which echoes the
+planned line straight back, so every "caller lines stay verbatim" assertion below still
+holds for the same reason it always did — a real reactive rewrite is covered separately
+in test_run_scenario_flow_node.py.
 """
 import pytest
 
 from app.core import runner, voice_caller
 from app.core import voice_native_ws as nws
 from app.core.node_script import PATH_TEST_TYPE, path_script_to_scenario
+from tests.core.fakes_llm import passthrough_chat
 from tests.core.fakes_native_ws import FakeAsyncClient, FakeConnect, FakeWebSocket, turn_frame
 
 
@@ -46,12 +54,14 @@ def fake_db(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def no_llm_caller(monkeypatch):
-    """A scripted scenario must never reach the AI Caller or the adaptive follow-up LLM."""
+    """A scripted scenario must never reach the AI Caller or the adaptive follow-up LLM
+    (both still forbidden); chat() IS now used, by _reactive_scripted_line, but stood in
+    with a deterministic passthrough so these tests stay verbatim and network-free."""
     def boom(*a, **kw):
-        raise AssertionError("scripted flow scenario must not generate caller text")
+        raise AssertionError("scripted flow scenario must not use the AI Caller")
 
     monkeypatch.setattr(runner, "next_utterance", boom)
-    monkeypatch.setattr(runner, "chat", boom)
+    monkeypatch.setattr(runner, "chat", passthrough_chat)
 
 
 class _Agent:
@@ -115,7 +125,10 @@ async def test_every_other_scripted_scenario_is_still_capped_at_five(fake_db, te
 
 
 async def test_flow_scenario_caller_lines_stay_verbatim_whatever_the_agent_says(fake_db):
-    # The agent goes completely off-path; the caller still says the next saved line.
+    # The agent goes completely off-path; with chat() stood in by passthrough_chat (a
+    # deterministic no-op), the caller still says the next saved line. A real chat()
+    # would instead react to the agent's reply — see
+    # test_run_scenario_flow_node.py::test_flow_node_caller_line_is_rephrased_to_answer_what_the_agent_actually_asked.
     agent = _Agent(["I can't help with that.", "Goodbye.", "What?", "Hello?"])
     await _run(_flow_path_scenario(4), agent)
     assert agent.sent == ["Caller line 1.", "Caller line 2.", "Caller line 3.", "Caller line 4."]

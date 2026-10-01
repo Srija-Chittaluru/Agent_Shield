@@ -149,11 +149,14 @@ def test_run_ignores_any_client_supplied_script_or_path(client, rec):
     assert json.loads(scenario["node_script_json"])["path"] == RECOVERY
 
 
-def test_agent_without_a_customer_context_still_runs_without_creating_one(client, rec, monkeypatch):
+def test_agent_without_a_customer_context_gets_one_created_on_run(client, rec, monkeypatch):
+    """Actually running a flow scenario is a meaningful action (same threshold
+    save_node_test uses): an agent with no customer context yet gets one created, so it
+    starts showing up in Existing Agent Testing / Existing Test Cases."""
     monkeypatch.setattr(flows_router, "get_customer_agent_by_agent_id", lambda aid: None)
-    monkeypatch.setattr(flows_router, "default_customer_agent", lambda aid: pytest.fail("must not create one"))
+    monkeypatch.setattr(flows_router, "default_customer_agent", lambda aid: 4242)
     assert _run(client).status_code == 200
-    assert ("insert_run", 83, 501, None) in rec.calls
+    assert ("insert_run", 83, 501, 4242) in rec.calls
 
 
 def test_temporal_down_is_503_and_the_run_is_marked_errored(client, rec, monkeypatch):

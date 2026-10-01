@@ -1053,11 +1053,13 @@ async def run_flow_scenario(flow_id: int, scenario_id: str) -> dict:
         flow_id, scenario_id, scenario["name"], scenario["path"], node_names,
         script["test_goal"], script["turns"],
     )
-    # Group the run under the agent's existing customer context if it has one; never
-    # create one just to run a flow scenario (runs.customer_agent_id is nullable).
-    customer_agent = get_customer_agent_by_agent_id(agent["id"])
+    # Actually running a flow scenario is a meaningful action (same threshold
+    # save_node_test uses) — attach it to the agent's existing customer context, or
+    # create one, so the agent starts showing up in Existing Agent Testing / Existing
+    # Test Cases. Merely uploading/planning a flow never does this on its own.
+    customer_agent_id = _resolve_customer_agent_id(agent["id"])
     run_id, group_id = await _start_single_scenario_run(
-        agent["id"], customer_agent["id"] if customer_agent else None, run_input
+        agent["id"], customer_agent_id, run_input
     )
     return {"run_id": run_id, "group_id": group_id, "flow_id": flow_id, "scenario_id": scenario_id}
 
@@ -1162,8 +1164,11 @@ async def _run_interrupt_scenario(flow_id: int, scenario_id: str, row: dict) -> 
         flow_id, scenario_id, item["name"], item, node_names,
         script["test_goal"], script["turns"], script["setup"], script["expectations"],
     )
-    customer_agent = get_customer_agent_by_agent_id(agent["id"])
+    # Same threshold as run_flow_scenario: actually running the scenario attaches (or
+    # creates) the agent's customer context, so it starts showing up in Existing Agent
+    # Testing / Existing Test Cases.
+    customer_agent_id = _resolve_customer_agent_id(agent["id"])
     run_id, group_id = await _start_single_scenario_run(
-        agent["id"], customer_agent["id"] if customer_agent else None, run_input
+        agent["id"], customer_agent_id, run_input
     )
     return {"run_id": run_id, "group_id": group_id, "flow_id": flow_id, "scenario_id": scenario_id}

@@ -1565,8 +1565,10 @@ function FlowScenarioScriptPanel({
       <p className="mt-5 text-xs font-medium uppercase tracking-wide text-[#9CA3AF]">Conversation script</p>
       <div className="mt-2 flex items-start gap-2 rounded-lg border border-sky-400/25 bg-sky-400/10 px-3 py-2 text-xs text-sky-200">
         <Info className="mt-0.5 h-3.5 w-3.5 shrink-0" strokeWidth={1.5} />
-        Caller lines are spoken exactly as written. The Voice Agent&apos;s real replies are
-        captured live and checked against &quot;Expected Agent Behavior&quot;.
+        Caller lines are the planned intent for this turn — at runtime they may be naturally
+        rephrased to actually answer what the Voice Agent just said, without changing what they
+        mean. The Voice Agent&apos;s real replies are captured live and checked against
+        &quot;Expected Agent Behavior&quot;.
       </div>
 
       <div className="mt-3 space-y-3">
@@ -1618,7 +1620,7 @@ function FlowScenarioScriptPanel({
             {speaks && (<>
             <p className="mt-3 flex items-center gap-1.5 text-xs font-medium text-emerald-300">
               <Mic className="h-3.5 w-3.5" strokeWidth={1.5} />
-              {kind === "interrupt" ? "Caller raises the interrupt (spoken verbatim)" : "Caller (spoken verbatim)"}
+              {kind === "interrupt" ? "Caller raises the interrupt (planned line — may be rephrased live)" : "Caller (planned line — may be rephrased live)"}
             </p>
             {editing ? (
               <textarea

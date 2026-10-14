@@ -704,7 +704,10 @@ export default function DashboardPage() {
     setGenerating(true);
     if (!regenerate) setStep("review");
     try {
-      const { scenarios } = await generateScenarios(agentId, selectedTypes(), guidance, combinedKnowledgeText);
+      const { scenarios } = await generateScenarios(
+        agentId, selectedTypes(), guidance, combinedKnowledgeText,
+        regenerate ? testCases.map((c) => ({ title: c.title, user_goal: c.user_goal })) : []
+      );
       const fresh: ReviewCase[] = scenarios.map((sc) => ({ ...sc, uid: nextUid(), source: "ai" }));
       if (regenerate) {
         // Keep = add the new cases to the current ones; Replace = the new ones stand alone.

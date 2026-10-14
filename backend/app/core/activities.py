@@ -36,7 +36,7 @@ from app.core.adapter import SYSTEM_FAULTS
 from app.core.fixer import explain_and_fix
 from app.core.judge import _endpoint_never_responded, judge_conversation
 from app.core.runner import run_scenario
-from app.core.scenarios import generate_scenarios
+from app.core.scenarios import extract_topics, generate_scenarios
 from app.core.scoring import compute
 from app.core.voice_caller import (
     call_voice_agent,
@@ -68,12 +68,17 @@ def load_agent(agent_id: int) -> dict | None:
 
 @activity.defn
 async def prepare_scenarios(
-    agent: dict, selected_types: list[str], guidance: str = "", knowledge: str = ""
+    agent: dict, selected_types: list[str], guidance: str = "", knowledge: str = "",
+    existing: list[dict] | None = None,
 ) -> list[dict]:
     """LLM (+ HTTP when auto-discovering). Build the scenario bank for one agent.
 
     Pure generation — nothing is persisted and nothing is executed. Used both by the
     review endpoint (POST /runs/scenarios) and by a run that was given no reviewed suite.
+
+    `existing` is the suite currently held for this agent, if any — only meaningful on a
+    Regenerate (see app.core.scenarios.generate_scenarios); omitted/None for a first-time
+    Generate, exactly as before this parameter existed.
     """
     # Resolve the agent's domain profile. Priority: uploaded docs > description >
     # auto-discovery (probe the agent and infer what it does).
@@ -90,12 +95,19 @@ async def prepare_scenarios(
             print(f"[activities] no docs/description — auto-discovering agent {agent.get('id')}")
             description = await discover_agent(agent)
 
+    # Identify the knowledge's distinct topics/conditions/branches first, so generation
+    # can deliberately spread coverage across them instead of repeating whichever ones
+    # it reaches for first — see app.core.scenarios.extract_topics.
+    topics = await extract_topics(knowledge)
+
     # Generate scenarios (falls back to a hardcoded bank on LLM failure).
     scenarios = await generate_scenarios(
         description or "A customer-support agent.",
         selected_types,
         guidance,
         knowledge,
+        topics=topics,
+        existing=existing,
     )
     # Demo safety: cap the number of scenarios so a live run stays fast.
     return scenarios[:MAX_SCENARIOS]

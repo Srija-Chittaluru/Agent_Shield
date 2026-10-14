@@ -39,6 +39,11 @@ class GenerateScenarios(BaseModel):
     tests: list[str] = []
     guidance: str = ""   # optional user domain focus / edge cases
     knowledge: str = ""  # optional uploaded agent docs (authoritative ground truth)
+    # The suite currently held for this agent, if any — only meaningful on a Regenerate
+    # (title/user_goal is enough). Steers generation toward topics/variations not
+    # already represented, and any exact-title repeat is dropped regardless. Empty for
+    # a first-time Generate.
+    existing: list[dict] = []
 
 
 class GenerateOne(BaseModel):
@@ -127,7 +132,9 @@ async def generate_run_scenarios(body: GenerateScenarios) -> dict:
     agent = get_agent(body.agent_id)
     if agent is None:
         raise HTTPException(status_code=404, detail=f"agent {body.agent_id} not found")
-    scenarios = await prepare_scenarios(dict(agent), body.tests, body.guidance, body.knowledge)
+    scenarios = await prepare_scenarios(
+        dict(agent), body.tests, body.guidance, body.knowledge, body.existing or None,
+    )
     return {"scenarios": scenarios}
 
 

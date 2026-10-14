@@ -221,15 +221,19 @@ export function saveAgentKnowledge(
 }
 
 // Stage 1 — generate the test suite for review. Runs nothing.
+// `existing` is the suite currently held for this agent — only meaningful on a
+// Regenerate, so the generator steers toward topics/variations not already covered
+// instead of repeating itself. Omit (or pass []) for a first-time Generate.
 export function generateScenarios(
   agentId: number,
   tests: string[],
   guidance = "",
-  knowledge = ""
+  knowledge = "",
+  existing: Pick<TestCase, "title" | "user_goal">[] = []
 ): Promise<{ scenarios: TestCase[] }> {
   return req("/runs/scenarios", {
     method: "POST",
-    body: JSON.stringify({ agent_id: agentId, tests, guidance, knowledge }),
+    body: JSON.stringify({ agent_id: agentId, tests, guidance, knowledge, existing }),
   });
 }
 

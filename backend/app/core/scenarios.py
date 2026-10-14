@@ -400,16 +400,103 @@ def _knowledge_block(knowledge: str) -> str:
     )
 
 
+TOPIC_SYSTEM_PROMPT = (
+    "You read an AI agent's own documentation and identify the DISTINCT topics, "
+    "workflows, conditions, and branches it describes — the different things a tester "
+    "could probe, never a summary of the whole document. Respond in json: "
+    '{"topics": ["...", ...]}. List 5-12 short topic labels (a few words each), each '
+    "naming one distinct subject, condition, or branch (e.g. 'patient identity "
+    "verification', 'packet redelivery after a move', 'counsellor routing request', "
+    "'retry when contact is unavailable') — never a generic label like 'general support' "
+    "that could describe any agent."
+)
+
+
+async def extract_topics(knowledge: str) -> list[str]:
+    """Identify the distinct topics/conditions/branches described in the agent's
+    knowledge docs, so generate_scenarios can deliberately spread coverage across them
+    instead of clustering on whichever facts the model reaches for first.
+
+    Returns [] for empty knowledge or on any failure — generation still proceeds,
+    just without topic steering, exactly as it did before this existed.
+    """
+    if not knowledge or not knowledge.strip():
+        return []
+    try:
+        result = await chat(
+            system=TOPIC_SYSTEM_PROMPT,
+            messages=[{
+                "role": "user",
+                "content": f"AGENT DOCS:\n{knowledge[:MAX_KNOWLEDGE_CHARS]}\n\n"
+                           "List the distinct topics now as json.",
+            }],
+            json_mode=True,
+        )
+        topics = result.get("topics") if isinstance(result, dict) else None
+        if isinstance(topics, list):
+            return [str(t).strip() for t in topics if str(t).strip()][:12]
+    except Exception as e:
+        print(f"[scenarios] topic extraction failed ({e}); generating without topic steering")
+    return []
+
+
+def _topics_block(topics: Optional[list[str]], existing: Optional[list[dict]]) -> str:
+    """DISTINCT TOPICS block (always, when topics were found) + SCENARIOS ALREADY
+    GENERATED block (only on a regenerate — `existing` is the suite currently held)."""
+    if not topics:
+        return ""
+    lines = ["\n\nDISTINCT TOPICS/CONDITIONS/BRANCHES IDENTIFIED IN THE KNOWLEDGE SOURCE:"]
+    lines += [f"- {t}" for t in topics]
+    lines.append(
+        "\nSpread your scenarios across these topics — do not cluster on only one or two "
+        "of them. Use whichever test_type (support/injection/memory/contradiction/"
+        "hallucination/happy_path) best fits each topic; a topic doesn't need its own "
+        "dedicated category, but your scenario set should collectively touch most of the "
+        "topics above, not repeat the same one."
+    )
+    titles = [str(e.get("title") or e.get("user_goal") or "").strip() for e in (existing or [])]
+    titles = [t for t in titles if t]
+    if titles:
+        lines.append(
+            "\nSCENARIOS ALREADY GENERATED FOR THIS AGENT (do NOT repeat these same topics/"
+            "questions — generate a genuinely DIFFERENT set: prioritize topics from the list "
+            "above not reflected below, or different variations — alternative branches, edge "
+            "cases, invalid/unexpected responses, interruptions — of ones that are):"
+        )
+        lines += [f"- {t}" for t in titles]
+    return "\n".join(lines)
+
+
+def _norm_title(s: object) -> str:
+    return " ".join(str(s or "").lower().split())
+
+
+def _drop_duplicate_titles(scenarios: list[dict], existing: list[dict]) -> list[dict]:
+    """Final safety net for 'avoid duplicates': drop anything whose title exactly matches
+    (case/whitespace-insensitive) an already-held scenario, in case the model's own
+    'do NOT repeat these' instruction wasn't enough on its own."""
+    existing_norm = {_norm_title(e.get("title") or e.get("user_goal")) for e in existing}
+    existing_norm.discard("")
+    return [s for s in scenarios if _norm_title(s.get("title")) not in existing_norm]
+
+
 async def generate_scenarios(
     agent_description: str,
     selected_types: Optional[list[str]] = None,
     guidance: str = "",
     knowledge: str = "",
+    topics: Optional[list[str]] = None,
+    existing: Optional[list[dict]] = None,
 ) -> list[dict]:
     """Generate the scenario bank. Filters to selected_types if given.
 
     `guidance` is the user's optional domain focus / edge cases — refined and targeted.
     `knowledge` is the agent's uploaded docs, if any — treated as authoritative ground truth.
+    `topics` (see extract_topics) steers coverage across the knowledge's distinct
+    subjects/branches instead of letting the model cluster on whichever it reaches for
+    first. `existing` is the suite currently held for this agent — only meaningful on a
+    Regenerate; passing it asks the model to explore topics/variations NOT already
+    represented there, and any exact-title repeat is dropped afterward regardless.
     Never raises for LLM problems — returns the hardcoded fallback bank instead.
     """
     selected = {t.lower() for t in (selected_types or [])} & VALID_TYPES
@@ -423,6 +510,7 @@ async def generate_scenarios(
                     "role": "user",
                     "content": f"Agent under test:\n{agent_description}"
                     + _knowledge_block(knowledge)
+                    + _topics_block(topics, existing)
                     + _guidance_block(guidance)
                     + f"\n\nRequested test types: {sorted(selected) if selected else 'all behavior tests (no system-failure)'}."
                     + "\n\nGenerate the scenarios now as json.",
@@ -442,6 +530,12 @@ async def generate_scenarios(
     if len(scenarios) < 4:  # generation too thin -> use reliable fallback
         print("[scenarios] using hardcoded fallback bank")
         scenarios = [dict(s) for s in FALLBACK_BANK]
+    elif existing:
+        # Never applied to the fallback bank above, which has no awareness of what's
+        # already stored — only a genuinely generated set is deduped against it.
+        deduped = _drop_duplicate_titles(scenarios, existing)
+        if deduped:  # never empty the set entirely over a title collision
+            scenarios = deduped
 
     if selected:
         filtered = [s for s in scenarios if s["test_type"] in selected]

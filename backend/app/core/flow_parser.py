@@ -470,7 +470,12 @@ def modular_interrupts(raw: dict, step_ids: set[str]) -> tuple[list[dict], list[
         {"id": <key>, "priority": int, "detection": {lang: {"keywords": [...],
          "negative": [...]}}, "outcome": "goto" | "end" | "resume",
          "target": <step id>   (outcome "goto" only),
-         "when": str, "end_status": str, "critical": bool, "max_turns": int  (when declared)}
+         "when": str, "end_status": str, "critical": bool, "max_turns": int,
+         "description": str, "reader_description": str  (when declared)}
+
+    `description`/`reader_description` are the agent's own words for when the interrupt
+    fires — what a flow that detects interrupts by meaning (no `detection` phrase list)
+    has instead of keywords. Kept verbatim, whitespace-collapsed.
 
     `outcome`/`target` come from the entry's `resume` field: "goto:<step>" hands the
     call to that step, "end" ends it (with `end_status`), "resume" returns to wherever
@@ -559,6 +564,9 @@ def modular_interrupts(raw: dict, step_ids: set[str]) -> tuple[list[dict], list[
             item["critical"] = bool(entry["critical"])
         if "max_turns" in entry:
             item["max_turns"] = entry["max_turns"]
+        for field in ("description", "reader_description"):
+            if isinstance(entry.get(field), str) and entry[field].strip():
+                item[field] = " ".join(entry[field].split())
         interrupts.append(item)
 
     return interrupts, errors

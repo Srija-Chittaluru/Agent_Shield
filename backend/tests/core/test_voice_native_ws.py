@@ -52,7 +52,7 @@ async def test_single_turn_captures_greeting_and_reply(monkeypatch):
     create_call = calls_log[0]
     assert create_call["url"] == "http://localhost:8000/api/calls"
     assert create_call["json"] == {"client": "acme_health"}
-    assert create_call["headers"] == {"Authorization": "Bearer qa-token"}
+    assert create_call["headers"] == {"Authorization": "Bearer qa-token", "X-Tenant": "acme_health"}
 
     # The tester's line went out as a simulated_utterance, not raw text.
     assert ws.sent == ['{"type": "simulated_utterance", "text": "I need an appointment"}']

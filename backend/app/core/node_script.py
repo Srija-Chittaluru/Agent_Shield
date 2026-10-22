@@ -577,6 +577,9 @@ CALLER, LISTEN, READBACK, INTERRUPT = "caller", "listen", "readback", "interrupt
 LISTEN_KINDS = ("say", "end")
 CALLER_KIND = "ask"
 MAX_BUG_GUARDS = 10
+# Generation attempts for one interrupt script: the first draft, then up to two
+# corrections with the validator's errors fed back to the model.
+INTERRUPT_SCRIPT_ATTEMPTS = 3
 
 INTERRUPT_SYSTEM_PROMPT = """You are generating a test script for a PRE-PLANNED voice-agent \
 scenario. Respond ONLY with a json object.
@@ -588,7 +591,9 @@ a good agent should do, for a judge; never write a sentence for the agent to say
 
 The interrupt is authoritative. Do not move it. Do not replace it. Do not add another interrupt.
 The interrupt jump is not an ordinary graph edge. The caller utterance must trigger the declared
-interrupt: it must contain one of its trigger phrases and none of its "must not" phrases.
+interrupt. When trigger phrases are listed, it must contain one of them and none of its "must not"
+phrases. When the interrupt is described in words instead, the caller must clearly say what that
+description means, in their own natural words, and must not say anything the description rules out.
 
 TURNS, in conversation order (each turn references a numbered STEP of the path). "type" is exactly
 one of caller | listen | readback | interrupt — never a step kind such as ask or say:
@@ -612,7 +617,8 @@ turn.
 
 CALLER LINES: natural, concise, concrete; no placeholders like [name], {dob} or <email>. Each
 line must clearly produce the transition the path takes next. Apart from the interrupt line, no
-caller line may contain any interrupt trigger phrase listed below. Use supplied record values
+caller line may contain any interrupt trigger phrase listed below, or say what any interrupt
+described below describes. Use supplied record values
 exactly; never invent personal details that were not supplied — if the caller must state one and
 none was supplied, choose a clearly fictional value and list it in "assumed_values".
 
@@ -636,6 +642,31 @@ def _norm_phrase(text: str) -> str:
 
 def _phrases(interrupt: dict, field: str) -> list[str]:
     return [p for spec in (interrupt.get("detection") or {}).values() for p in spec.get(field, [])]
+
+
+def _detected_by_phrases(interrupt: dict) -> bool:
+    """Whether the flow declares trigger phrases for this interrupt. A flow that detects
+    interrupts by meaning (its agent reads a `description`, no `detection` list) has
+    none, so there is nothing lexical to check a caller line against."""
+    return bool(_phrases(interrupt, "keywords"))
+
+
+_TEMPLATE_TOKEN = re.compile(r"\{([^{}]+)\}")
+
+
+def _interrupt_meaning(interrupt: dict, record: dict) -> str:
+    """The interrupt's own description of when it fires (reader_description first, the
+    one written for a reader of the caller's words), with template tokens such as
+    {user.first_name} filled from the record, or neutrally worded when not supplied —
+    never left in, since a caller line copying one would be a placeholder."""
+    text = interrupt.get("reader_description") or interrupt.get("description") or ""
+
+    def fill(m: "re.Match") -> str:
+        token = m.group(1).strip()
+        value = record.get(token, record.get(token.split(".")[-1]))
+        return str(value) if value not in (None, "") else "the person this call is for"
+
+    return _TEMPLATE_TOKEN.sub(fill, text)
 
 
 def _triggers(line: str, interrupt: dict) -> bool:
@@ -713,10 +744,16 @@ def _build_interrupt_prompt(
             for field in ("priority", "critical", "max_turns"):
                 if field in interrupt:
                     desc.append(f"    {field}: {interrupt[field]}")
-            desc.append(f"    trigger phrases (use one): {', '.join(_phrases(interrupt, 'keywords'))}")
-            negatives = _phrases(interrupt, "negative")
-            if negatives:
-                desc.append(f"    must NOT contain: {', '.join(negatives)}")
+            if _detected_by_phrases(interrupt):
+                desc.append(f"    trigger phrases (use one): {', '.join(_phrases(interrupt, 'keywords'))}")
+                negatives = _phrases(interrupt, "negative")
+                if negatives:
+                    desc.append(f"    must NOT contain: {', '.join(negatives)}")
+            else:
+                meaning = _interrupt_meaning(interrupt, record)
+                desc.append("    no trigger phrases: the agent recognises this interrupt by meaning. The "
+                            "caller line must clearly say this, and nothing it rules out:")
+                desc.append(f"    {meaning or 'the ' + repr(interrupt['id']) + ' situation, stated plainly'}")
             parts.extend(desc)
             continue
         for node_id in seg["steps"]:
@@ -728,9 +765,13 @@ def _build_interrupt_prompt(
                 parts.append(f"  -> next: {nxt} (via {', '.join(edge_info[(node_id, nxt)])})")
     others = [i for i in interrupts if i["id"] != interrupt["id"]]
     if others:
-        parts.append("\nOTHER INTERRUPTS — no caller line may contain these trigger phrases:")
+        parts.append("\nOTHER INTERRUPTS — no caller line may contain these trigger phrases or say "
+                     "what these describe:")
         for i in others:
-            parts.append(f"  {i['id']}: {', '.join(_phrases(i, 'keywords'))}")
+            if _detected_by_phrases(i):
+                parts.append(f"  {i['id']}: {', '.join(_phrases(i, 'keywords'))}")
+            else:
+                parts.append(f"  {i['id']}: {_interrupt_meaning(i, record) or '(no description)'}")
     parts.append("\nRECORD VALUES (use exactly):" if record else "\nRECORD VALUES: none supplied.")
     for k, v in record.items():
         parts.append(f"  {k}: {v}")
@@ -805,7 +846,9 @@ def validate_interrupt_script(
             if not isinstance(line, str) or not line.strip():
                 errors.append(f"turns[{i}].caller_line must be a non-empty string.")
             else:
-                if not _triggers(line, interrupt):
+                # Only a phrase-detected interrupt can be checked here; one detected by
+                # meaning is judged by the run itself (did the real agent take it?).
+                if _detected_by_phrases(interrupt) and not _triggers(line, interrupt):
                     errors.append(
                         f"turns[{i}].caller_line must contain one of the '{interrupt['id']}' trigger phrases "
                         "and none of its excluded phrases."
@@ -919,18 +962,34 @@ async def generate_interrupt_script(
     scenario: dict, *, details: dict, node_kinds: dict[str, str], readback_steps: set,
     interrupts: list[dict], record: dict, flow_name: str, edges: list[dict],
 ) -> dict:
-    """One LLM call, then validate_interrupt_script. No fallback, no repair."""
-    result = await chat(
-        system=INTERRUPT_SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": _build_interrupt_prompt(
-            scenario, details, interrupts, record, readback_steps, flow_name, edges,
-        )}],
-        json_mode=True,
-    )
-    return validate_interrupt_script(
-        result, scenario, node_kinds=node_kinds, readback_steps=readback_steps,
-        interrupts=interrupts, record=record,
-    )
+    """LLM call, then validate_interrupt_script. A draft that breaks a rule goes back to
+    the model with its exact errors, up to INTERRUPT_SCRIPT_ATTEMPTS in all; the
+    validator is never relaxed and nothing is repaired here — only a draft that passes
+    it is returned, else the last attempt's NodeScriptError is raised."""
+    messages = [{"role": "user", "content": _build_interrupt_prompt(
+        scenario, details, interrupts, record, readback_steps, flow_name, edges,
+    )}]
+    for attempt in range(INTERRUPT_SCRIPT_ATTEMPTS):
+        result = await chat(system=INTERRUPT_SYSTEM_PROMPT, messages=messages, json_mode=True)
+        try:
+            return validate_interrupt_script(
+                result, scenario, node_kinds=node_kinds, readback_steps=readback_steps,
+                interrupts=interrupts, record=record,
+            )
+        except NodeScriptError as e:
+            if attempt == INTERRUPT_SCRIPT_ATTEMPTS - 1:
+                raise
+            messages = [*messages,
+                        {"role": "assistant", "content": json.dumps(result)},
+                        {"role": "user", "content": _retry_feedback(e.errors)}]
+    raise AssertionError("unreachable")
+
+
+def _retry_feedback(errors: list[str]) -> str:
+    return ("That script breaks these rules:\n" + "\n".join(f"- {err}" for err in errors)
+            + "\nReturn the whole corrected script as json. Keep everything that was right; "
+            "change only what these errors name. Remember: BRANCH steps get no turn at all, "
+            "listen turns only at SAY/END steps, caller turns only at ASK steps.")
 
 
 # ---------------------------------------------------------------------------

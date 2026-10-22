@@ -155,6 +155,35 @@ def test_every_maya_interrupt_generates_a_valid_draft(client, llm, plan, table):
     assert table.rows == []  # drafts are never saved
 
 
+def _listen_at_branch(script, item):
+    """`script` with a listen turn at the first branch step of the path — the mistake
+    gpt-4o-mini made in the wild ("step 2 (route_good_time) is 'branch'")."""
+    bad = copy.deepcopy(script)
+    step = next(i + 1 for i, n in enumerate(item["path"]) if KINDS.get(n) == "branch")
+    bad["turns"].insert(0, {"type": "listen", "step": step, "node_id": item["path"][step - 1],
+                            "expected_agent_behavior": "The agent routes the call."})
+    return bad
+
+
+def test_a_broken_draft_is_sent_back_with_its_errors_and_the_fix_is_returned(client, llm, plan):
+    item = next(i for i in plan[0].values() if any(KINDS.get(n) == "branch" for n in i["path"]))
+    good = _script_for(item)
+    replies = iter([_listen_at_branch(good, item), good])
+    llm.reply = lambda prompt: copy.deepcopy(next(replies))
+    res = _generate(client, item["id"])
+    assert res.status_code == 200, res.text
+    assert len(llm.calls) == 2
+
+
+def test_a_draft_still_broken_after_every_attempt_is_a_422(client, llm, plan):
+    item = next(i for i in plan[0].values() if any(KINDS.get(n) == "branch" for n in i["path"]))
+    llm.reply = _listen_at_branch(_script_for(item), item)
+    res = _generate(client, item["id"])
+    assert res.status_code == 422
+    assert "listen turns belong at say/end steps" in res.text
+    assert len(llm.calls) == node_script.INTERRUPT_SCRIPT_ATTEMPTS
+
+
 def test_prompt_carries_the_planned_scenario(client, llm, plan):
     item = plan[0]["prove_identity"]
     llm.reply = _script_for(item)
@@ -345,6 +374,48 @@ def test_ordinary_caller_lines_may_not_trigger_an_interrupt(plan):
     s = _mutate(item, lambda s: _turn(s, lambda t: t.get("node_id") == "ask_identity").update(
         caller_line="Sorry, wrong number."))
     assert "would trigger interrupt 'wrong_number'" in _errors(item, s)
+
+
+BEREAVED = ("the caller says the patient this call is for, {user.first_name}, has died. "
+            "NOT somebody else dying (\"my aunt's funeral\")")
+
+
+def _by_meaning(item):
+    """`item` as the current Maya flow declares it: no `detection` phrase list, only a
+    description the agent reads for meaning."""
+    item = copy.deepcopy(item)
+    item["interrupt"].pop("detection", None)
+    item["interrupt"]["reader_description"] = BEREAVED
+    return item
+
+
+def test_interrupt_detected_by_meaning_validates_without_trigger_phrases(plan):
+    original = plan[0]["bereavement"]
+    item = _by_meaning(original)
+    script = _mutate(original, lambda s: _turn(s, lambda t: t["type"] == "interrupt").update(
+        caller_line="I'm sorry, Daniel passed away last month."))
+    out = _validate(item, script)
+    assert _turn(out, lambda t: t["type"] == "interrupt")["caller_line"] == "I'm sorry, Daniel passed away last month."
+
+
+def test_interrupt_detected_by_meaning_keeps_every_other_rule(plan):
+    original = plan[0]["bereavement"]
+    item = _by_meaning(original)
+    empty = _mutate(original, lambda s: _turn(s, lambda t: t["type"] == "interrupt").update(caller_line=""))
+    assert "caller_line must be a non-empty string" in _errors(item, empty)
+    also = _mutate(original, lambda s: _turn(s, lambda t: t["type"] == "interrupt").update(
+        caller_line="He passed away, and I want to talk to a person."))
+    assert "would also trigger interrupt 'human_request'" in _errors(item, also)
+
+
+def test_prompt_gives_the_description_when_there_are_no_trigger_phrases(plan):
+    item = _by_meaning(plan[0]["bereavement"])
+    prompt = node_script._build_interrupt_prompt(item, {}, INTERRUPTS, RECORD, READBACK, "maya", [])
+    assert "trigger phrases (use one)" not in prompt.split("OTHER INTERRUPTS")[0]
+    assert "recognises this interrupt by meaning" in prompt
+    assert "the patient this call is for, Daniel, has died" in prompt  # template filled from the record
+    unfilled = node_script._build_interrupt_prompt(item, {}, INTERRUPTS, {}, READBACK, "maya", [])
+    assert "{user.first_name}" not in unfilled
 
 
 def test_placeholders_and_bad_shapes_are_rejected(plan):

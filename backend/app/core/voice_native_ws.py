@@ -16,6 +16,7 @@ already plays with `endpoint_url` meaning something else for its own protocol):
                          own frontend does (same-origin, protocol-swapped).
     request_template  -> the JSON body for POST /api/calls, e.g. {"client": "acme"}.
     auth_header       -> "Authorization: Bearer <token>", sent on the two HTTP calls
+                         (with X-Tenant: <body's "client">, which the target requires)
                          only — the WebSocket handshake itself carries no auth (the
                          call_id is the capability, per the target's own security
                          model: see its app/api/security.py).
@@ -96,6 +97,8 @@ class _Session:
     """
     call_id: str = ""
     base_url: str = ""
+    # The HTTP headers the call was created with, reused for its /end call.
+    headers: dict = field(default_factory=dict)
     ws: Any = None
     closed: bool = False
     opening_line: Optional[str] = None
@@ -128,6 +131,17 @@ def _auth_headers(agent: Any) -> dict[str, str]:
         name, _, value = agent["auth_header"].partition(":")
         if name and value:
             headers[name.strip()] = value.strip()
+    return headers
+
+
+def _call_headers(agent: Any, body: dict) -> dict[str, str]:
+    """Headers for the target's HTTP calls: the auth header, plus X-Tenant naming the
+    client the call is for (the target rejects POST /api/calls without it), taken from
+    the create-call body's "client" field."""
+    headers = _auth_headers(agent)
+    client = body.get("client")
+    if isinstance(client, str) and client.strip():
+        headers["X-Tenant"] = client.strip()
     return headers
 
 
@@ -346,7 +360,8 @@ async def _open_session(agent: Any, session: _Session) -> None:
     session.base_url = base_url
 
     body = _create_call_body(agent)
-    headers = _auth_headers(agent)
+    headers = _call_headers(agent, body)
+    session.headers = headers
     async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT_S) as client:
         resp = await client.post(f"{base_url}/api/calls", json=body, headers=headers)
         resp.raise_for_status()
@@ -489,7 +504,9 @@ async def close_native_ws_session(session_key: Any) -> None:
     if session.call_id and session.base_url:
         try:
             async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT_S) as client:
-                await client.post(f"{session.base_url}/api/calls/{session.call_id}/end")
+                await client.post(
+                    f"{session.base_url}/api/calls/{session.call_id}/end", headers=session.headers
+                )
         except Exception:
             pass
 

@@ -194,3 +194,15 @@ def test_generic_steps_flow_is_unchanged():
                                    "interrupts": [{"key": "h", "resume": "goto:b"}]}), "yaml")
     assert "interrupts" not in r
     assert r["edges"] == [{"from": "a", "to": "b"}]
+
+
+def test_interrupt_descriptions_are_kept_for_detection_by_meaning():
+    from app.core.flow_parser import modular_interrupts
+    raw = {"interrupts": [{"key": "bereavement", "resume": "end",
+                           "reader_description": "the caller says the patient\n  has died",
+                           "description": "the patient has died"}]}
+    items, errors = modular_interrupts(raw, set())
+    assert errors == []
+    assert items[0]["reader_description"] == "the caller says the patient has died"
+    assert items[0]["description"] == "the patient has died"
+    assert "detection" not in items[0]

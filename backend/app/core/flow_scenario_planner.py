@@ -67,6 +67,32 @@ BEFORE_FIELD_CONFIRMED = "before_field_confirmed"
 
 _STATUS_CONDITION = re.compile(r"^\s*status\.([A-Za-z_][A-Za-z0-9_]*)\s*(==|!=)\s*'[^']*'\s*$")
 
+# The `answer.<field>` condition syntax (also accepted with `status.`), as a modular
+# flow writes it: "answer.is_patient == 'Yes'", "missing(answer.good_time)", and
+# and/or/not combinations of those. Only the fields named and how they are compared
+# are read, to choose a placement — the condition itself is never evaluated.
+_FIELD_COMPARISON = re.compile(r"\b(?:answer|status)\.([A-Za-z_][A-Za-z0-9_]*)\s*(==|!=)")
+_FIELD_MISSING = re.compile(r"\bmissing\(\s*(?:answer|status)\.([A-Za-z_][A-Za-z0-9_]*)\s*\)")
+_NEGATED_GROUP = re.compile(r"\bnot\s*\([^()]*\)")
+
+
+def _field_condition(when: str) -> Optional[tuple[str, list[str], bool]]:
+    """(policy, fields, any_of) for an `answer.<field>` condition, or None when it names
+    no field. A `not (...)` group is something that must still be false, so it does not
+    decide the placement. A field compared with `==` must already be collected:
+    AFTER_FIELD_CONFIRMED — after the first of them for an `or`, all of them otherwise.
+    With none, a `!=` or `missing(...)` field is one not yet collected:
+    BEFORE_FIELD_CONFIRMED, at the first of them."""
+    text = _NEGATED_GROUP.sub(" ", when)
+    comparisons = _FIELD_COMPARISON.findall(text)
+    confirmed = list(dict.fromkeys(f for f, op in comparisons if op == "=="))
+    if confirmed:
+        return AFTER_FIELD_CONFIRMED, confirmed, " or " in f" {text} "
+    pending = list(dict.fromkeys([f for f, op in comparisons if op == "!="] + _FIELD_MISSING.findall(text)))
+    if pending:
+        return BEFORE_FIELD_CONFIRMED, pending, True
+    return None
+
 
 def plan_flow_scenarios(flow: dict, max_scenarios: int = DEFAULT_MAX_SCENARIOS) -> dict:
     """{"path_scenarios", "base", "interrupt_scenarios"} for a parsed flow.
@@ -147,16 +173,27 @@ class _Context:
             return {"policy": AFTER_GREETING, "index": index}
 
         match = _STATUS_CONDITION.match(when)
-        if not match:
-            return {"policy": None, "unplaced": f"condition {when!r} is not tied to a collected field"}
-        field, op = match.group(1), match.group(2)
-        policy = AFTER_FIELD_CONFIRMED if op == "==" else BEFORE_FIELD_CONFIRMED
-        collector = next(
-            (i for i, n in enumerate(base_path) if self.nodes.get(n, {}).get("field", {}).get("key") == field), None
-        )
-        if collector is None:
-            return {"policy": policy, "field": field,
-                    "unplaced": f"no step on the base path collects field '{field}'"}
+        if match:
+            field, op = match.group(1), match.group(2)
+            policy = AFTER_FIELD_CONFIRMED if op == "==" else BEFORE_FIELD_CONFIRMED
+            collector = self._collector(base_path, field)
+            if collector is None:
+                return {"policy": policy, "field": field,
+                        "unplaced": f"no step on the base path collects field '{field}'"}
+        else:
+            parsed = _field_condition(when)
+            if parsed is None:
+                return {"policy": None, "unplaced": f"condition {when!r} is not tied to a collected field"}
+            policy, fields, any_of = parsed
+            collected = {f: self._collector(base_path, f) for f in fields}
+            missing = [f for f, i in collected.items() if i is None]
+            if missing and (not any_of or len(missing) == len(fields)):
+                return {"policy": policy, "field": missing[0],
+                        "unplaced": f"no step on the base path collects field '{missing[0]}'"}
+            present = {f: i for f, i in collected.items() if i is not None}
+            pick = min if any_of else max
+            field = pick(present, key=present.get)
+            collector = present[field]
         if policy == BEFORE_FIELD_CONFIRMED:
             return {"policy": policy, "field": field, "field_step": base_path[collector], "index": collector}
         index = self._first_caller_turn(base_path, collector + 1)
@@ -164,6 +201,11 @@ class _Context:
             return {"policy": policy, "field": field, "field_step": base_path[collector],
                     "unplaced": f"no caller turn after '{base_path[collector]}' on the base path"}
         return {"policy": policy, "field": field, "field_step": base_path[collector], "index": index}
+
+    def _collector(self, base_path: list[str], field: str) -> Optional[int]:
+        return next(
+            (i for i, n in enumerate(base_path) if self.nodes.get(n, {}).get("field", {}).get("key") == field), None
+        )
 
     # --- continuation after a goto target ----------------------------------------
     def _continuations_from(self, target: str) -> list[list[str]]:
@@ -189,9 +231,29 @@ class _Context:
         return declares_resume and not self.facts.out_adj.get(node_id)
 
     # --- scenario ----------------------------------------------------------------
+    def _base_for(self, interrupt: dict, base: tuple[int, dict]) -> tuple[tuple[int, dict], dict]:
+        """(base, placement) for `interrupt`: the shared base path, unless the field its
+        condition needs is collected only off that path — then the best-ranked other
+        candidate from the same entry that does collect it. Only ever an existing
+        flow_graph candidate; the shared base's reason is kept when none fits."""
+        placement = self._placement(interrupt, base[1]["path"])
+        if "unplaced" not in placement or "field" not in placement:
+            return base, placement
+        entry = base[1]["path"][0]
+        others = sorted(
+            ((i, c) for i, c in enumerate(self.candidates)
+             if i != base[0] and c["path"][0] == entry and not c["contains_retry"]),
+            key=lambda o: self._rank(o[0], o[1]["path"]),
+        )
+        for other in others:
+            alt = self._placement(interrupt, other[1]["path"])
+            if "unplaced" not in alt:
+                return other, alt
+        return base, placement
+
     def interrupt_scenario(self, interrupt: dict, base: tuple[int, dict]) -> dict:
+        base, placement = self._base_for(interrupt, base)
         base_path = base[1]["path"]
-        placement = self._placement(interrupt, base_path)
         scenario = {
             "key": f"interrupt:{interrupt['id']}",
             "category": "interrupt",

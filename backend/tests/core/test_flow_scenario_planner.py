@@ -239,7 +239,7 @@ def test_unplaceable_interrupts_are_reported_not_forced():
         [{"id": "a", "kind": "say", "next": "b"}, {"id": "b", "kind": "say", "next": "c"}, {"id": "c", "kind": "end"}],
         [
             {"key": "no_turn", "resume": "end"},                                   # no caller turn exists
-            {"key": "odd_when", "resume": "end", "when": "answer.x == 'y'"},       # not a status.<field> condition
+            {"key": "odd_when", "resume": "end", "when": "turn_count > 3"},        # names no field at all
             {"key": "no_field", "resume": "end", "when": "status.zzz == 'confirmed'"},  # nobody collects zzz
         ],
     )
@@ -269,3 +269,52 @@ def test_field_metadata_is_parsed_only_for_modular_steps(maya):
     assert "field" not in nodes["greet"]
     generic = parse_flow(yaml.safe_dump({"steps": [{"id": "a", "name": "A", "field": {"key": "k"}}]}), "yaml")
     assert "field" not in generic["nodes"][0]
+
+
+def _three_asks(interrupts):
+    ask = lambda i, nxt: {"id": f"ask_{i}", "kind": "ask", "next": nxt,
+                          "field": {"key": i, "save_to": f"answer.{i}"}}
+    return _modular(
+        [{"id": "greet", "kind": "say", "next": "ask_a"}, ask("a", "ask_b"), ask("b", "ask_c"),
+         ask("c", "done"), {"id": "done", "kind": "end"}],
+        interrupts,
+    )
+
+
+@pytest.mark.parametrize("when, policy, field, step", [
+    ("answer.a == 'Yes'", "after_field_confirmed", "a", "ask_b"),
+    ("missing(answer.b)", "before_field_confirmed", "b", "ask_b"),
+    ("answer.b != 'Yes' and answer.c != 'Yes'", "before_field_confirmed", "b", "ask_b"),
+    # an `or`: the first field collected is enough
+    ("(answer.b == 'Yes' or answer.a == user.a) and not (answer.c == 'Yes')", "after_field_confirmed", "a", "ask_b"),
+    # an `and`: every field it names must be collected first
+    ("answer.a == 'Yes' and answer.b == 'No'", "after_field_confirmed", "b", "ask_c"),
+])
+def test_answer_field_conditions_are_placed(when, policy, field, step):
+    s = plan_flow_scenarios(_three_asks([{"key": "x", "resume": "resume", "when": when}]))["interrupt_scenarios"][0]
+    assert s["plannable"] is True, s.get("reason")
+    assert s["placement"]["policy"] == policy
+    assert s["placement"]["field"] == field and s["placement"]["step"] == step
+
+
+def test_answer_field_condition_on_an_uncollected_field_is_reported():
+    s = plan_flow_scenarios(_three_asks([{"key": "x", "resume": "end", "when": "answer.zzz == 'Yes'"}]))["interrupt_scenarios"][0]
+    assert s["plannable"] is False and "collects field 'zzz'" in s["reason"]
+
+
+def test_field_collected_only_off_the_base_path_uses_a_path_that_collects_it():
+    ask = lambda i, nxt: {"id": f"ask_{i}", "kind": "ask", "next": nxt,
+                          "field": {"key": i, "save_to": f"answer.{i}"}}
+    # The longer branch (b -> c -> d) is the base; only the short one collects `side`.
+    flow = _modular(
+        [{"id": "start", "kind": "ask", "next": "route"},
+         {"id": "route", "kind": "branch", "cases": [
+             {"when": "answer.x == 'y'", "goto": "ask_side"}], "default": "ask_b"},
+         ask("side", "ask_e"), ask("e", "done"), ask("b", "ask_c"), ask("c", "ask_d"), ask("d", "ask_f"),
+         ask("f", "done"),
+         {"id": "done", "kind": "end"}],
+        [{"key": "x", "resume": "resume", "when": "answer.side == 'Yes'"}],
+    )
+    s = plan_flow_scenarios(flow)["interrupt_scenarios"][0]
+    assert s["plannable"] is True, s.get("reason")
+    assert "ask_side" in s["path"] and s["placement"]["field_step"] == "ask_side"

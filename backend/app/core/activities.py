@@ -327,6 +327,9 @@ def load_replay_context(conversation_id: int) -> dict | None:
             "assigned_fault": s["assigned_fault"],
             "expected_behavior": s["expected_behavior"],
             "seed_turns": _json.loads(s["seed_turns_json"] or "[]"),
+            # Without these a dynamic (AI-Caller) scenario would replay as a scripted one.
+            "customer_context": s.get("customer_context") or "",
+            "max_turns": s.get("max_turns"),
             **_replay_call_variables(s.get("node_script_json")),
         },
         "agent": dict(agent_row),

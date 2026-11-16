@@ -110,8 +110,8 @@ question whether it should have happened, and never evaluate the plan's `when` c
 judge only what the agent actually did. Use the transcript and the OBSERVED facts (taken from
 the agent's own trace) as evidence. Check, in order:
 1. recognized — did the agent treat the caller's interrupt line as the PLANNED interrupt? The
-   planned key among the observed interrupt keys is evidence it did; when the agent's
-   transport reports interrupt keys, no key (or a different key) on that reply is evidence it
+   planned key among the observed interrupt keys is evidence it did; when the agent
+   reports interrupt keys, no key (or a different key) on that reply is evidence it
    did NOT — e.g. treating the line as an ordinary answer, a decline, or a hang-up reason.
 2. handled — did its reply to that line do what that turn's expected behavior says?
 3. planned outcome —
@@ -155,7 +155,7 @@ is not a failure. Use the REACHED STEPS / STEPS NEVER REACHED split:
   never reached is not evidence of anything the agent did or didn't do.
 - A never-reached step counts against the agent ONLY if the scenario's own goal/expected_behavior
   explicitly states the conversation must continue to that point regardless (e.g. "the agent must
-  keep asking the renewal questions even if the contact is unavailable"). If it does not say that,
+  keep collecting the required details even if the caller is not the account holder"). If it does not say that,
   ending the call early is not itself evidence of failure.
 - Still fail the agent for anything it actually did wrong in the REACHED steps (wrong information,
   unsafe behavior, ignoring what the caller actually said, or ending in a way the scenario's own
@@ -302,15 +302,26 @@ def _interrupt_plan(scenario: dict) -> dict | None:
     return None
 
 
-def _reports_interrupt_keys(conv: dict) -> bool:
-    """Whether this run's transport reports the agent's interrupt keys at all (native_ws
-    turn events carry `interrupt_key`), so a missing key is evidence rather than silence."""
+# Trace fields through which an agent reports its own flow state: the answers it has
+# collected, the interrupt it recognized, and the status it ended the call with.
+FLOW_SIGNAL_FIELDS = ("answers", "interrupt_key", "end_status")
+
+
+def _reports_flow_signals(conv: dict, traces: list[dict]) -> bool:
+    """Whether the agent reports flow signals at all, so a missing interrupt key or end
+    status is evidence rather than silence. Never inferred from the agent's protocol.
+
+    The agent's own `reports_flow_signals` setting decides when it is set. Unset, this
+    conversation's trace decides: any agent turn carrying a FLOW_SIGNAL_FIELDS field."""
     try:
         run = get_run(conv["run_id"]) if conv.get("run_id") is not None else None
         agent = get_agent(dict(run)["agent_id"]) if run else None
     except Exception:
-        return False
-    return bool(agent) and dict(agent).get("voice_protocol") == "native_ws"
+        agent = None
+    setting = dict(agent).get("reports_flow_signals") if agent else None
+    if setting is not None:
+        return bool(setting)
+    return any(isinstance(t, dict) and t.get(f) for t in traces for f in FLOW_SIGNAL_FIELDS)
 
 
 def _observed(msgs: list[dict]) -> dict:
@@ -372,8 +383,8 @@ def _interrupt_context(plan: dict, observed: dict, reports_keys: bool) -> str:
     lines += ["", "OBSERVED (from the agent's own trace)"]
     lines.append("  interrupt keys the agent reported: " + (
         ", ".join(f"{k} (turn {t})" for t, k in keys) if keys else
-        "none" + (" — this transport reports interrupt keys, so none was recognized" if reports_keys else
-                  " (this transport may not report interrupt keys; judge from the transcript)")))
+        "none" + (" — this agent reports interrupt keys, so none was recognized" if reports_keys else
+                  " (this agent may not report interrupt keys; judge from the transcript)")))
     lines.append("  end status reported: " + (
         f"{observed['end_status']!r} (turn {observed['end_turn']}) — the agent ended the call"
         if observed["end_status"] else "none — the agent did not end the call with a status"))
@@ -402,8 +413,8 @@ def _structured_failures(plan: dict, observed: dict, reports_signals: bool) -> l
     nothing here can make a scenario pass.
 
       - an `end` interrupt whose reported end status differs from the planned one;
-      - where the transport reports the agent's interrupt keys and end status
-        (native_ws turn events carry both): the planned key never reported (the
+      - where the agent reports flow signals (see _reports_flow_signals): the
+        planned key never reported (the
         interrupt was not recognized), or an `end` interrupt with no end status (the
         call did not end).
     """
@@ -575,7 +586,7 @@ async def judge_conversation(conversation: Any) -> dict:
     # instead; every other scenario's prompt is byte-for-byte what it was.
     plan = _interrupt_plan(scenario)
     observed = _observed(msgs) if plan else None
-    reports_signals = _reports_interrupt_keys(conv) if plan else False
+    reports_signals = _reports_flow_signals(conv, traces) if plan else False
     interrupt_block = (
         _interrupt_context(plan, observed, reports_signals) + "\n\n" if plan else ""
     )

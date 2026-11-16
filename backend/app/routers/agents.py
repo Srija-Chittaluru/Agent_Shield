@@ -35,6 +35,9 @@ class RegisterAgent(BaseModel):
     # Only used when http_method="GET". JSON string mapping "message"/"history"/"faults"
     # to the query parameter names the target agent expects, e.g. '{"message":"q"}'.
     query_param_map: str | None = None
+    # Whether the agent reports flow signals (answers / interrupt_key / end_status) in its
+    # trace. None = not declared: the Judge decides per conversation from the trace.
+    reports_flow_signals: bool | None = None
 
 
 class AgentKnowledge(BaseModel):
@@ -52,6 +55,7 @@ def _row_to_dict(row) -> dict:
         "endpoint_url": r["endpoint_url"], "response_path": r["response_path"],
         "http_method": r.get("http_method") or "POST",
         "query_param_map": r.get("query_param_map"),
+        "reports_flow_signals": r.get("reports_flow_signals"),
         "description": r["description"], "created_at": r["created_at"],
         "knowledge_name": r.get("knowledge_name"),
         "knowledge_chars": len(r.get("knowledge") or ""),
@@ -92,6 +96,7 @@ def register(body: RegisterAgent) -> dict:
             voice_protocol=body.voice_protocol,
             http_method=body.http_method,
             query_param_map=body.query_param_map,
+            reports_flow_signals=body.reports_flow_signals,
         )
         if body.description:
             update_agent_description(existing["id"], body.description)
@@ -109,6 +114,7 @@ def register(body: RegisterAgent) -> dict:
         voice_protocol=body.voice_protocol,
         http_method=body.http_method,
         query_param_map=body.query_param_map,
+        reports_flow_signals=body.reports_flow_signals,
     )
     return {"agent_id": agent_id}
 

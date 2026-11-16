@@ -40,12 +40,13 @@ def _msgs(*turns):
 
 
 class _Judge:
-    def __init__(self, monkeypatch, row, msgs, reply, protocol="native_ws"):
+    def __init__(self, monkeypatch, row, msgs, reply, signals=None, protocol="native_ws"):
         self.calls, self.saved = [], None
         monkeypatch.setattr(judge, "get_scenario", lambda sid: row)
         monkeypatch.setattr(judge, "get_messages", lambda cid: msgs)
         monkeypatch.setattr(judge, "get_run", lambda rid: {"id": rid, "agent_id": 87})
-        monkeypatch.setattr(judge, "get_agent", lambda aid: {"id": aid, "voice_protocol": protocol})
+        monkeypatch.setattr(judge, "get_agent", lambda aid: {"id": aid, "voice_protocol": protocol,
+                                                              "reports_flow_signals": signals})
         monkeypatch.setattr(judge, "update_conversation_verdict", lambda *a: setattr(self, "saved", a))
 
         async def chat(system, messages, **kw):
@@ -458,15 +459,14 @@ async def test_goto_not_recognized_fails(monkeypatch):
                  ("agent", "Great, may I speak with Daniel?", {"answers": {"good_time": "Yes"}}))
     j = _Judge(monkeypatch, _row("human_request")[0], msgs, _reply(accuracy=0.3, recognized=False, handled=False, outcome=False))
     result = await j()
-    assert "interrupt keys the agent reported: none — this transport reports interrupt keys, so none was recognized" in j.user
+    assert "interrupt keys the agent reported: none — this agent reports interrupt keys, so none was recognized" in j.user
     assert result["verdict"] == "fail" and "planned interrupt not recognized" in result["evidence"]
 
 
-async def test_missing_key_is_not_called_unrecognized_when_the_transport_cannot_report_keys(monkeypatch):
-    j = _Judge(monkeypatch, _row("human_request")[0], GOTO_MSGS[:2] + [dict(GOTO_MSGS[2], trace_json=None)], _reply(),
-               protocol="http_json")
+async def test_missing_key_is_not_called_unrecognized_when_the_agent_reports_no_signals(monkeypatch):
+    j = _Judge(monkeypatch, _row("human_request")[0], GOTO_MSGS[:2] + [dict(GOTO_MSGS[2], trace_json=None)], _reply())
     await j()
-    assert "none (this transport may not report interrupt keys; judge from the transcript)" in j.user
+    assert "none (this agent may not report interrupt keys; judge from the transcript)" in j.user
 
 
 # ---------------------------------------------------------------------------
@@ -657,7 +657,7 @@ async def test_maya_human_request_run_229_treated_as_decline(monkeypatch):
         accuracy=0.1, recognized=False, handled=False, outcome=False, expected=False, violated=[1, 2],
         observed="It re-asked the availability question and ended the call as a decline."))
     result = await j()
-    assert "interrupt keys the agent reported: none — this transport reports interrupt keys, so none was recognized" in j.user
+    assert "interrupt keys the agent reported: none — this agent reports interrupt keys, so none was recognized" in j.user
     assert "'Retry Scheduled | In Progress' (turn 2) — the agent ended the call" in j.user
     assert result["verdict"] == "fail" and result["severity"] == "high"
     ev = result["evidence"]
@@ -672,8 +672,8 @@ async def test_maya_human_request_run_229_treated_as_decline(monkeypatch):
 class _Sequence:
     """Judge whose model returns `replies` in order (an Exception is raised)."""
 
-    def __init__(self, monkeypatch, row, msgs, replies, protocol="native_ws"):
-        self.base = _Judge(monkeypatch, row, msgs, {}, protocol)
+    def __init__(self, monkeypatch, row, msgs, replies):
+        self.base = _Judge(monkeypatch, row, msgs, {})
         self.replies = list(replies)
 
         async def chat(system, messages, **kw):
@@ -727,9 +727,40 @@ async def test_end_interrupt_without_an_end_status_fails_on_a_reporting_transpor
     assert result["verdict"] == "fail" and "the call did not end (no end status reported)" in result["evidence"]
 
 
-async def test_structured_checks_do_not_apply_where_the_transport_reports_nothing(monkeypatch):
+async def test_structured_checks_do_not_apply_where_the_agent_reports_nothing(monkeypatch):
     msgs = _end_msgs(reply="Sorry! Goodbye.")
     result = await _Judge(monkeypatch, _row("wrong_number")[0], msgs, _reply(accuracy=1.0), protocol="http_json")()
+    assert result["verdict"] == "pass"
+
+
+# Whether the agent reports flow signals is decided by its own setting or its trace —
+# never by its protocol.
+async def test_native_ws_agent_without_signals_is_not_falsely_failed(monkeypatch):
+    msgs = _end_msgs(reply="Sorry! Goodbye.")
+    j = _Judge(monkeypatch, _row("wrong_number")[0], msgs, _reply(accuracy=1.0), protocol="native_ws")
+    result = await j()
+    assert "this agent may not report interrupt keys" in j.user
+    assert result["verdict"] == "pass"
+
+
+async def test_http_json_agent_that_reports_signals_gets_the_structured_checks(monkeypatch):
+    msgs = _end_msgs(reply="Sorry! Goodbye.", interrupt_key="wrong_number")
+    result = await _Judge(monkeypatch, _row("wrong_number")[0], msgs, _reply(accuracy=1.0), protocol="http_json")()
+    assert result["verdict"] == "fail" and "the call did not end (no end status reported)" in result["evidence"]
+
+
+async def test_declared_signals_apply_the_structured_checks_even_when_none_were_reported(monkeypatch):
+    msgs = _end_msgs(reply="Sorry! Goodbye.")
+    result = await _Judge(monkeypatch, _row("wrong_number")[0], msgs, _reply(accuracy=1.0), signals=True)()
+    assert result["verdict"] == "fail"
+    assert "the agent never reported the planned interrupt 'wrong_number'" in result["evidence"]
+
+
+async def test_declared_no_signals_overrides_the_trace(monkeypatch):
+    msgs = _end_msgs(reply="Sorry! Goodbye.", answers={"good_time": "No"})
+    j = _Judge(monkeypatch, _row("wrong_number")[0], msgs, _reply(accuracy=1.0), signals=False)
+    result = await j()
+    assert "this agent may not report interrupt keys" in j.user
     assert result["verdict"] == "pass"
 
 

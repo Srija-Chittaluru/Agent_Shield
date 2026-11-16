@@ -161,6 +161,12 @@ def init_schema() -> None:
         -- app.core.adapter.DEFAULT_QUERY_PARAM_MAP.
         ALTER TABLE agents ADD COLUMN IF NOT EXISTS query_param_map TEXT;
 
+        -- Whether the agent reports flow signals (answers / interrupt_key / end_status)
+        -- in its trace, so the Judge can treat a missing one as evidence. NULL = not
+        -- declared: the Judge decides from each conversation's trace instead (see
+        -- app.core.judge._reports_flow_signals).
+        ALTER TABLE agents ADD COLUMN IF NOT EXISTS reports_flow_signals BOOLEAN;
+
         -- Idempotency, so a re-executed unit of work converges on the same rows instead
         -- of appending new ones. This is the precondition for turning on retries.
         --
@@ -327,17 +333,18 @@ def insert_agent(
     voice_protocol: str = "http_json",
     http_method: str = "POST",
     query_param_map: str | None = None,
+    reports_flow_signals: bool | None = None,
 ) -> int:
     conn = get_conn()
     cur = conn.execute(
         """INSERT INTO agents
            (name, kind, endpoint_url, auth_header, request_template,
             response_path, description, created_at, modality, voice_protocol,
-            http_method, query_param_map)
-           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+            http_method, query_param_map, reports_flow_signals)
+           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
         (name, kind, endpoint_url, auth_header, request_template,
          response_path, description, now_iso(), modality, voice_protocol,
-         http_method, query_param_map),
+         http_method, query_param_map, reports_flow_signals),
     )
     agent_id = cur.fetchone()["id"]
     conn.commit()
@@ -354,6 +361,7 @@ def update_agent_connection(
     voice_protocol: str,
     http_method: str,
     query_param_map: str | None,
+    reports_flow_signals: bool | None = None,
 ) -> None:
     """Refresh a re-registered agent's connection details in place.
 
@@ -363,14 +371,18 @@ def update_agent_connection(
     previously discarded silently (only description ever got updated), so a wrong
     API key or protocol typed on attempt 1 stuck around forever no matter how many
     times the form was resubmitted. This makes every reconnect attempt authoritative.
+
+    reports_flow_signals is the exception: None (not sent — the Connect form never sends
+    it) keeps the stored value, so reconnecting never erases a declared setting.
     """
     conn = get_conn()
     conn.execute(
         """UPDATE agents SET auth_header = %s, request_template = %s, response_path = %s,
-           modality = %s, voice_protocol = %s, http_method = %s, query_param_map = %s
+           modality = %s, voice_protocol = %s, http_method = %s, query_param_map = %s,
+           reports_flow_signals = COALESCE(%s, reports_flow_signals)
            WHERE id = %s""",
         (auth_header, request_template, response_path, modality, voice_protocol,
-         http_method, query_param_map, agent_id),
+         http_method, query_param_map, reports_flow_signals, agent_id),
     )
     conn.commit()
     conn.close()

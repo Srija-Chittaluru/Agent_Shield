@@ -300,3 +300,133 @@ async def test_next_agent_turn_skips_binary_and_non_turn_text_frames():
     ])
     result = await nws._next_agent_turn(ws)
     assert result["text"] == "the real reply"
+
+
+# ---------------------------------------------------------------------------
+# protocol_config: an agent with the same shape but its own wire format.
+# ---------------------------------------------------------------------------
+
+def _config(**overrides) -> str:
+    import json
+
+    return json.dumps(overrides)
+
+
+async def test_protocol_config_drives_a_differently_named_agent(monkeypatch):
+    """Every path, field name and message type comes from the agent's config, and the
+    flow signals land in the trace under their standard names."""
+    import json
+
+    def frame(role, text, **state):
+        return json.dumps({"event": "message", "from": role, "payload": {"text": text, "state": state}})
+
+    ws = FakeWebSocket(incoming=[
+        frame("bot", "Welcome."),
+        json.dumps({"event": "ping"}),
+        frame("user", "cancel my order"),
+        frame("bot", "Cancelled. Goodbye.", outcome="completed", step="cancel"),
+    ])
+    connect = FakeConnect([ws])
+    calls_log: list[dict] = []
+    http_client = FakeAsyncClient(
+        calls_log, create_path="/v1/sessions", create_response={"data": {"session_id": "s-9"}},
+    )
+    monkeypatch.setattr(nws.websockets, "connect", connect)
+    monkeypatch.setattr(nws.httpx, "AsyncClient", http_client.factory())
+    agent = _agent(protocol_config=_config(
+        create_call_path="/v1/sessions",
+        call_id_path="data.session_id",
+        ws_path="/v1/stream/{call_id}",
+        end_call_path="/v1/sessions/{call_id}/close",
+        tenant_header=None,
+        send_template={"event": "user_message", "content": "{message}"},
+        event_type_path="event",
+        turn_type="message",
+        speaking_type=None,
+        role_path="from",
+        agent_role="bot",
+        caller_role="user",
+        text_path="payload.text",
+        end_status_path="payload.state.outcome",
+        interrupt_key_path="payload.state.step",
+        answers_path=None,
+    ))
+
+    result = await nws._call_via_native_ws(agent, "cancel my order", session_key="conv-cfg")
+    await nws.close_native_ws_session("conv-cfg")
+
+    assert result["reply"] == "Cancelled. Goodbye."
+    assert result["trace"]["opening_line"] == "Welcome."
+    assert result["trace"]["call_id"] == "s-9"
+    assert result["trace"]["end_status"] == "completed"
+    assert result["trace"]["interrupt_key"] == "cancel"
+    assert "answers" not in result["trace"]
+    assert calls_log[0]["url"] == "http://localhost:8000/v1/sessions"
+    assert "X-Tenant" not in calls_log[0]["headers"]
+    assert connect.urls == ["ws://localhost:8000/v1/stream/s-9"]
+    assert ws.sent == ['{"event": "user_message", "content": "cancel my order"}']
+    assert calls_log[-1]["url"] == "http://localhost:8000/v1/sessions/s-9/close"
+
+
+async def test_agent_without_a_create_call_step_connects_straight_away(monkeypatch):
+    import json
+
+    ws = FakeWebSocket(incoming=[json.dumps({"text": "Hi, how can I help?"})])
+    sent = ws.send
+
+    async def send_then_reply(data):  # this agent echoes nothing: it just answers
+        await sent(data)
+        ws.push(json.dumps({"text": "Your balance is $20."}))
+
+    ws.send = send_then_reply
+    connect = FakeConnect([ws])
+    calls_log: list[dict] = []
+    monkeypatch.setattr(nws.websockets, "connect", connect)
+    monkeypatch.setattr(nws.httpx, "AsyncClient", FakeAsyncClient(calls_log).factory())
+    agent = _agent(protocol_config=_config(
+        create_call_path=None, ws_path="/ws?token=abc", end_call_path=None,
+        event_type_path=None, role_path=None,
+    ))
+
+    result = await nws._call_via_native_ws(agent, "what's my balance?", session_key="conv-direct")
+    await nws.close_native_ws_session("conv-direct")
+
+    assert result["reply"] == "Your balance is $20."
+    assert result["trace"]["opening_line"] == "Hi, how can I help?"
+    assert "call_id" not in result["trace"]
+    assert connect.urls == ["ws://localhost:8000/ws?token=abc"]
+    assert calls_log == []  # no create call, no end call
+
+
+def test_no_protocol_config_means_the_defaults():
+    assert nws.protocol_config(_agent()) == nws.NATIVE_WS_DEFAULTS
+    assert nws.protocol_config(_agent(protocol_config="{}")) == nws.NATIVE_WS_DEFAULTS
+
+
+@pytest.mark.parametrize("raw, problem", [
+    ("not json", "not valid JSON"),
+    ('["a"]', "must be a JSON object"),
+    ('{"ws_pth": "/ws"}', "unknown key(s) ws_pth"),
+    ('{"text_path": null}', "text_path cannot be empty"),
+    ('{"turn_type": 5}', "'turn_type' must be a string or null"),
+    ('{"send_template": "plain text {message}"}', "send_template must be a JSON object"),
+    ('{"create_call_path": null}', "ws_path, end_call_path uses {call_id}"),
+])
+def test_unusable_protocol_config_is_rejected_with_the_reason(raw, problem):
+    with pytest.raises(ValueError, match=problem.replace("(", r"\(").replace(")", r"\)")):
+        nws.protocol_config(_agent(protocol_config=raw))
+
+
+async def test_unusable_protocol_config_fails_the_call_setup_cleanly(monkeypatch):
+    calls_log: list[dict] = []
+    connect = FakeConnect([])
+    monkeypatch.setattr(nws.websockets, "connect", connect)
+    monkeypatch.setattr(nws.httpx, "AsyncClient", FakeAsyncClient(calls_log).factory())
+
+    result = await nws._call_via_native_ws(
+        _agent(protocol_config='{"ws_pth": "/ws"}'), "hi", session_key="conv-bad",
+    )
+
+    assert result["reply"] == nws.AGENT_ERROR_SENTINEL
+    assert "unknown key(s) ws_pth" in result["trace"]["error"]
+    assert calls_log == [] and connect.call_count == 0

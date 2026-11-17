@@ -38,6 +38,9 @@ class RegisterAgent(BaseModel):
     # Whether the agent reports flow signals (answers / interrupt_key / end_status) in its
     # trace. None = not declared: the Judge decides per conversation from the trace.
     reports_flow_signals: bool | None = None
+    # Only for voice_protocol="native_ws": JSON object overriding any part of its wire
+    # format (see app.core.voice_native_ws.NATIVE_WS_DEFAULTS). None = the defaults.
+    protocol_config: str | None = None
 
 
 class AgentKnowledge(BaseModel):
@@ -56,6 +59,7 @@ def _row_to_dict(row) -> dict:
         "http_method": r.get("http_method") or "POST",
         "query_param_map": r.get("query_param_map"),
         "reports_flow_signals": r.get("reports_flow_signals"),
+        "protocol_config": r.get("protocol_config"),
         "description": r["description"], "created_at": r["created_at"],
         "knowledge_name": r.get("knowledge_name"),
         "knowledge_chars": len(r.get("knowledge") or ""),
@@ -85,6 +89,14 @@ def register(body: RegisterAgent) -> dict:
     http method) is refreshed from this submission too, so correcting a wrong API key or
     protocol on a second attempt actually takes effect instead of being silently discarded.
     """
+    if body.protocol_config:
+        from app.core.voice_native_ws import protocol_config
+
+        try:
+            protocol_config({"protocol_config": body.protocol_config})
+        except ValueError as e:
+            raise HTTPException(status_code=422, detail=str(e))
+
     existing = get_agent_by_name_and_endpoint(body.name, body.endpoint_url)
     if existing:
         update_agent_connection(
@@ -97,6 +109,7 @@ def register(body: RegisterAgent) -> dict:
             http_method=body.http_method,
             query_param_map=body.query_param_map,
             reports_flow_signals=body.reports_flow_signals,
+            protocol_config=body.protocol_config,
         )
         if body.description:
             update_agent_description(existing["id"], body.description)
@@ -115,6 +128,7 @@ def register(body: RegisterAgent) -> dict:
         http_method=body.http_method,
         query_param_map=body.query_param_map,
         reports_flow_signals=body.reports_flow_signals,
+        protocol_config=body.protocol_config,
     )
     return {"agent_id": agent_id}
 

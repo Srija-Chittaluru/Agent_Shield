@@ -78,15 +78,25 @@ class _FakeResponse:
 
 class FakeAsyncClient:
     """Stands in for httpx.AsyncClient — logs every POST, and answers
-    POST .../api/calls with `call_id` (or raises, if `fail_create`).
+    POST ...`create_path` with `call_id` (or raises, if `fail_create`). `create_response`
+    replaces that answer's body, for an agent whose response is shaped differently.
     """
 
     calls_log: list[dict] = []  # overwritten per-instance in __init__; class attr is just a type hint
 
-    def __init__(self, calls_log: list[dict], call_id: str = "call-1", fail_create: bool = False):
+    def __init__(
+        self,
+        calls_log: list[dict],
+        call_id: str = "call-1",
+        fail_create: bool = False,
+        create_path: str = "/api/calls",
+        create_response: Optional[dict] = None,
+    ):
         self.calls_log = calls_log
         self.call_id = call_id
         self.fail_create = fail_create
+        self.create_path = create_path
+        self.create_response = create_response
 
     def factory(self):
         """Return a callable usable as `httpx.AsyncClient` (i.e. `Client(timeout=...)`)."""
@@ -104,10 +114,10 @@ class FakeAsyncClient:
 
             async def post(self, url: str, json: Optional[dict] = None, headers: Optional[dict] = None):
                 outer.calls_log.append({"url": url, "json": json, "headers": headers})
-                if url.endswith("/api/calls"):
+                if url.endswith(outer.create_path):
                     if outer.fail_create:
                         raise RuntimeError("connection refused")
-                    return _FakeResponse({"call_id": outer.call_id})
+                    return _FakeResponse(outer.create_response or {"call_id": outer.call_id})
                 return _FakeResponse({"ok": True})
 
         return _Client

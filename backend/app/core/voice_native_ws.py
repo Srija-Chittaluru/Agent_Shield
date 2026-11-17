@@ -8,8 +8,8 @@ app.core.twilio_bridge's persistent-session pattern, but far simpler: this modul
 a WebSocket *client*, not a server accepting an inbound stream, so there is no
 webhook/router half to it at all.
 
-Field reuse on the `agents` row (no schema changes — the same trick twilio_bridge
-already plays with `endpoint_url` meaning something else for its own protocol):
+Field reuse on the `agents` row (the same trick twilio_bridge already plays with
+`endpoint_url` meaning something else for its own protocol):
     endpoint_url      -> HTTP base URL, e.g. "http://localhost:8000". Used for both
                          POST {base}/api/calls and, scheme-swapped (http -> ws,
                          https -> wss), the WebSocket URL — exactly what the target's
@@ -20,8 +20,11 @@ already plays with `endpoint_url` meaning something else for its own protocol):
                          only — the WebSocket handshake itself carries no auth (the
                          call_id is the capability, per the target's own security
                          model: see its app/api/security.py).
+    protocol_config   -> optional JSON object overriding any part of the wire format
+                         below, for an agent with the same shape but its own paths,
+                         field names and message types (see NATIVE_WS_DEFAULTS).
 
-Wire contract below is the TARGET's own (not ours) — see its
+The default wire contract below is the TARGET's own (not ours) — see its
 app/api/routes/simulator.py and app/transports/orchestrator_processor.py:
     POST {base}/api/calls          {request_template body} -> {"call_id": "<uuid>"}
     WS   {base}/api/ws/{call_id}   opened once, held for the whole scenario
@@ -66,7 +69,7 @@ from typing import Any, Optional
 import httpx
 import websockets
 
-from app.core.adapter import DEFAULT_TIMEOUT_S
+from app.core.adapter import DEFAULT_TIMEOUT_S, _extract_by_path, _render_body
 
 # Matches app.core.judge.AGENT_ERROR_SENTINEL / app.core.voice_caller.AGENT_ERROR_SENTINEL
 # exactly — kept as a literal, same tradeoff already made in twilio_bridge.py.
@@ -86,6 +89,100 @@ SETTLE_S = 4.0
 AUDIO_QUIET_S = 1.0
 SPEAKING_MAX_S = DEFAULT_TIMEOUT_S
 MAX_OUTPUT_S = 120.0
+
+
+# The wire format this transport speaks. An agent's `protocol_config` (a JSON object)
+# may override any of these keys; a key it leaves out keeps the value here, so an agent
+# without one speaks exactly this (the original target's) format. Every *_path is a dot
+# path into a JSON message, read with app.core.adapter._extract_by_path ("data.text",
+# "items.0.id"); a null optional key turns that feature off.
+NATIVE_WS_DEFAULTS: dict = {
+    # HTTP POST that creates the call, relative to endpoint_url. null = no such step:
+    # the WebSocket is opened straight away (then no path may use {call_id}).
+    "create_call_path": "/api/calls",
+    # Where the created call's id is in that POST's JSON response.
+    "call_id_path": "call_id",
+    # The WebSocket path, relative to endpoint_url (scheme-swapped); {call_id} is filled.
+    "ws_path": "/api/ws/{call_id}",
+    # Best-effort HTTP POST that ends the call. null = none.
+    "end_call_path": "/api/calls/{call_id}/end",
+    # Header naming the tenant on the HTTP calls, valued from this create-call body
+    # field when it is a non-empty string. null tenant_header = no such header.
+    "tenant_header": "X-Tenant",
+    "tenant_field": "client",
+    # The JSON message sent for each caller line; {message} is the line (rendered with
+    # app.core.adapter._render_body, like a chat agent's request_template). A JSON
+    # object is accepted too.
+    "send_template": '{"type": "simulated_utterance", "text": "{message}"}',
+    # How an incoming JSON message is recognized. event_type_path null = messages carry
+    # no type: every message is a turn and none reports speaking.
+    "event_type_path": "type",
+    "turn_type": "turn",            # null = every message is a turn
+    "speaking_type": "speaking",    # null = the agent reports no speaking state
+    "speaking_path": "speaking",
+    "role_path": "role",            # null = every turn is the agent's
+    "agent_role": "agent",
+    "caller_role": "caller",        # the echo of a caller line; null = none is sent
+    "text_path": "text",
+    # The agent's flow signals, reported in the trace under these standard names
+    # (end_status, answers, interrupt_key) whatever the agent calls them. null = not reported.
+    "end_status_path": "end_status",
+    "answers_path": "answers",
+    "interrupt_key_path": "interrupt_key",
+}
+_REQUIRED_CONFIG_KEYS = ("ws_path", "send_template", "agent_role", "text_path")
+_FLOW_SIGNALS = ("end_status", "answers", "interrupt_key")
+
+
+def protocol_config(agent: Any) -> dict:
+    """The agent's wire format: NATIVE_WS_DEFAULTS with its `protocol_config` applied.
+
+    Raises ValueError naming the problem when the config is not usable — not JSON, not
+    an object, an unknown key (a typo would otherwise be silently ignored), a required
+    key set to null, a send_template that is not a JSON object, or {call_id} used with
+    no create-call step. Used both at registration and when a call is set up.
+    """
+    config = dict(NATIVE_WS_DEFAULTS)
+    raw = agent.get("protocol_config")
+    if not raw:
+        return config
+    try:
+        overrides = json.loads(raw) if isinstance(raw, str) else raw
+    except (json.JSONDecodeError, ValueError):
+        raise ValueError("protocol_config is not valid JSON")
+    if not isinstance(overrides, dict):
+        raise ValueError("protocol_config must be a JSON object")
+    unknown = sorted(set(overrides) - set(NATIVE_WS_DEFAULTS))
+    if unknown:
+        raise ValueError(
+            f"protocol_config has unknown key(s) {', '.join(unknown)} "
+            f"(known: {', '.join(NATIVE_WS_DEFAULTS)})"
+        )
+    config.update(overrides)
+    if isinstance(config["send_template"], dict):
+        config["send_template"] = json.dumps(config["send_template"])
+    for key, value in config.items():
+        if value is not None and not isinstance(value, str):
+            raise ValueError(f"protocol_config {key!r} must be a string or null")
+    missing = [k for k in _REQUIRED_CONFIG_KEYS if not config[k]]
+    if config["create_call_path"] and not config["call_id_path"]:
+        missing.append("call_id_path")
+    if missing:
+        raise ValueError(f"protocol_config {', '.join(missing)} cannot be empty")
+    try:
+        rendered = json.loads(config["send_template"].replace("{message}", ""))
+    except (json.JSONDecodeError, ValueError):
+        rendered = None
+    if not isinstance(rendered, dict):
+        raise ValueError("protocol_config send_template must be a JSON object")
+    if not config["create_call_path"]:
+        uses_id = [k for k in ("ws_path", "end_call_path") if "{call_id}" in (config[k] or "")]
+        if uses_id:
+            raise ValueError(
+                f"protocol_config {', '.join(uses_id)} uses {{call_id}}, but there is no "
+                "create_call_path to create a call"
+            )
+    return config
 
 
 @dataclass
@@ -110,19 +207,27 @@ class _Session:
     pending: list = field(default_factory=list)
     # Why setting the call up failed, when it did — reported by every later turn.
     setup_error: Optional[str] = None
+    # The agent's wire format (see protocol_config), fixed when the call is set up.
+    config: dict = field(default_factory=lambda: dict(NATIVE_WS_DEFAULTS))
 
 
 _SESSIONS: dict[Any, _Session] = {}
 
 
-def _ws_url(base_url: str, call_id: str) -> str:
+def _call_path(path: str, call_id: str) -> str:
+    """A configured path, with this call's id filled in and a leading slash."""
+    path = path.replace("{call_id}", call_id)
+    return path if path.startswith("/") else "/" + path
+
+
+def _ws_url(base_url: str, path: str) -> str:
     if base_url.startswith("https://"):
         ws_base = "wss://" + base_url[len("https://"):]
     elif base_url.startswith("http://"):
         ws_base = "ws://" + base_url[len("http://"):]
     else:
         ws_base = base_url
-    return f"{ws_base.rstrip('/')}/api/ws/{call_id}"
+    return f"{ws_base.rstrip('/')}{path}"
 
 
 def _auth_headers(agent: Any) -> dict[str, str]:
@@ -134,14 +239,14 @@ def _auth_headers(agent: Any) -> dict[str, str]:
     return headers
 
 
-def _call_headers(agent: Any, body: dict) -> dict[str, str]:
-    """Headers for the target's HTTP calls: the auth header, plus X-Tenant naming the
-    client the call is for (the target rejects POST /api/calls without it), taken from
-    the create-call body's "client" field."""
+def _call_headers(agent: Any, body: dict, config: dict) -> dict[str, str]:
+    """Headers for the target's HTTP calls: the auth header, plus the tenant header
+    naming the client the call is for (by default X-Tenant from the create-call body's
+    "client" field — the original target rejects POST /api/calls without it)."""
     headers = _auth_headers(agent)
-    client = body.get("client")
-    if isinstance(client, str) and client.strip():
-        headers["X-Tenant"] = client.strip()
+    tenant = body.get(config["tenant_field"]) if config["tenant_field"] else None
+    if config["tenant_header"] and isinstance(tenant, str) and tenant.strip():
+        headers[config["tenant_header"]] = tenant.strip()
     return headers
 
 
@@ -222,8 +327,38 @@ def _create_call_body(agent: Any) -> dict:
     return filled
 
 
-async def _next_agent_turn(ws: Any) -> Optional[dict]:
-    """Read frames until an agent-role "turn" event arrives.
+def _event_kind(payload: dict, config: dict) -> Optional[str]:
+    """What one incoming JSON message is under the agent's wire format: "agent" (an
+    agent turn), "caller" (the echo of a caller line), "speaking", or None (ignored)."""
+    type_path = config["event_type_path"]
+    kind = _extract_by_path(payload, type_path) if type_path else None
+    if type_path and config["speaking_type"] is not None and kind == config["speaking_type"]:
+        return "speaking"
+    if type_path and config["turn_type"] is not None and kind != config["turn_type"]:
+        return None
+    if not config["role_path"]:
+        return "agent"
+    role = _extract_by_path(payload, config["role_path"])
+    if role == config["agent_role"]:
+        return "agent"
+    if config["caller_role"] is not None and role == config["caller_role"]:
+        return "caller"
+    return None
+
+
+def _agent_turn(payload: dict, config: dict) -> dict:
+    """An agent turn in this module's own shape — its text plus the flow signals under
+    their standard names — whatever the agent's wire format calls them."""
+    turn = {"text": _extract_by_path(payload, config["text_path"])}
+    for name in _FLOW_SIGNALS:
+        path = config[f"{name}_path"]
+        if path:
+            turn[name] = _extract_by_path(payload, path)
+    return turn
+
+
+async def _next_agent_turn(ws: Any, config: Optional[dict] = None) -> Optional[dict]:
+    """Read frames until an agent turn arrives (by default an agent-role "turn" event).
 
     Skips the "caller" echo of the tester's own utterance, "speaking"/
     "interruption" frames, and any binary frame (the target's own real TTS audio,
@@ -244,8 +379,9 @@ async def _next_agent_turn(ws: Any) -> Optional[dict]:
             continue
         if not isinstance(payload, dict):
             continue
-        if payload.get("type") == "turn" and payload.get("role") == "agent":
-            return payload
+        cfg = config or NATIVE_WS_DEFAULTS
+        if _event_kind(payload, cfg) == "agent":
+            return _agent_turn(payload, cfg)
 
 
 async def _read_agent_output(session: _Session, first_timeout: float = DEFAULT_TIMEOUT_S) -> list[dict]:
@@ -266,6 +402,7 @@ async def _read_agent_output(session: _Session, first_timeout: float = DEFAULT_T
       - MAX_OUTPUT_S has passed since the first turn.
     """
     loop = asyncio.get_running_loop()
+    config = session.config
     turns: list[dict] = []
     speaking = False
     last_turn = last_audio = last_speaking = cap = 0.0
@@ -301,25 +438,25 @@ async def _read_agent_output(session: _Session, first_timeout: float = DEFAULT_T
             continue
         if not isinstance(payload, dict):
             continue
-        kind = payload.get("type")
+        kind = _event_kind(payload, config)
         if kind == "speaking":
-            speaking = bool(payload.get("speaking"))
+            path = config["speaking_path"]
+            speaking = bool(_extract_by_path(payload, path)) if path else True
             last_speaking = now
             continue
-        if kind != "turn":
-            continue
-        if payload.get("role") == "caller":
+        if kind == "caller":
             if turns:
                 session.pending.insert(0, raw)
                 return turns
             continue  # the echo of the line just sent
-        if payload.get("role") != "agent":
+        if kind != "agent":
             continue
         if not turns:
             cap = now + MAX_OUTPUT_S
-        turns.append(payload)
+        turn = _agent_turn(payload, config)
+        turns.append(turn)
         last_turn = now
-        if payload.get("end_status"):
+        if turn.get("end_status"):
             return turns
 
 
@@ -343,11 +480,12 @@ def _combine_turns(turns: list[dict]) -> tuple[str, dict]:
 
 
 async def _open_session(agent: Any, session: _Session) -> None:
-    """Fill in `session` in place: create the call over HTTP, open the WebSocket,
-    and drain the agent's unprompted opening greeting.
+    """Fill in `session` in place: create the call over HTTP (unless the agent's wire
+    format has no create-call step), open the WebSocket, and drain the agent's
+    unprompted opening greeting.
 
-    Raises on a genuine setup failure (bad endpoint_url, HTTP error, no call_id in
-    the response, WebSocket connect failure) — the caller tombstones `session` on
+    Raises on a genuine setup failure (bad endpoint_url, unusable protocol_config, HTTP
+    error, no call_id in the response, WebSocket connect failure) — the caller tombstones `session` on
     any exception here. Failing to capture the greeting itself is NOT such a
     failure (a slow/silent agent shouldn't block the whole session), so that part
     has its own narrower try/except.
@@ -358,20 +496,24 @@ async def _open_session(agent: Any, session: _Session) -> None:
             "voice_protocol 'native_ws' requires an endpoint_url (the agent's HTTP base URL)"
         )
     session.base_url = base_url
+    config = protocol_config(agent)
+    session.config = config
 
     body = _create_call_body(agent)
-    headers = _call_headers(agent, body)
+    headers = _call_headers(agent, body, config)
     session.headers = headers
-    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT_S) as client:
-        resp = await client.post(f"{base_url}/api/calls", json=body, headers=headers)
-        resp.raise_for_status()
-        data = resp.json()
-    call_id = data.get("call_id") if isinstance(data, dict) else None
-    if not call_id:
-        raise ValueError(f"POST /api/calls did not return a call_id: {data!r}")
-    session.call_id = str(call_id)
+    if config["create_call_path"]:
+        create_path = _call_path(config["create_call_path"], "")
+        async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT_S) as client:
+            resp = await client.post(f"{base_url}{create_path}", json=body, headers=headers)
+            resp.raise_for_status()
+            data = resp.json()
+        call_id = _extract_by_path(data, config["call_id_path"]) if isinstance(data, (dict, list)) else None
+        if not call_id:
+            raise ValueError(f"POST {create_path} did not return a {config['call_id_path']}: {data!r}")
+        session.call_id = str(call_id)
 
-    session.ws = await websockets.connect(_ws_url(base_url, session.call_id))
+    session.ws = await websockets.connect(_ws_url(base_url, _call_path(config["ws_path"], session.call_id)))
 
     try:
         # The whole opening — a greeting may be followed straight away by the agent's
@@ -395,8 +537,8 @@ async def _call_via_native_ws(
 
     FIRST turn for a given `session_key`: creates the call and opens the socket
     (see `_open_session`). EVERY turn (first and subsequent): sends this turn's
-    text as a `simulated_utterance` on the SAME open socket and waits for the
-    agent's `"turn"` reply.
+    text (by default as a `simulated_utterance`; see NATIVE_WS_DEFAULTS) on the SAME
+    open socket and waits for the agent's reply.
 
     `history`/`faults` are accepted for signature parity with every other voice
     transport (app.core.voice_caller.call_voice_agent calls all of them the same
@@ -425,13 +567,13 @@ async def _call_via_native_ws(
             session.closed = True
             return {"reply": AGENT_ERROR_SENTINEL, "trace": {"error": f"native_ws call setup error: {e}"}}
 
-    trace: dict = {"call_id": session.call_id}
+    trace: dict = {"call_id": session.call_id} if session.call_id else {}
     if session.opening_line is not None:
         trace["opening_line"] = session.opening_line
         session.opening_line = None  # only the very first turn carries it
 
     try:
-        await session.ws.send(json.dumps({"type": "simulated_utterance", "text": message}))
+        await session.ws.send(json.dumps(_render_body(session.config["send_template"], message, [], [])))
         turns = await _read_agent_output(session)
     except Exception as e:
         session.closed = True  # tombstone — a later turn must fail fast, not reconnect silently
@@ -501,11 +643,13 @@ async def close_native_ws_session(session_key: Any) -> None:
             await session.ws.close(code=1000, reason="scenario finished")
         except Exception:
             pass
-    if session.call_id and session.base_url:
+    end_path = session.config["end_call_path"]
+    # Only a call that was actually created (or, with no create step, connected) is ended.
+    if end_path and session.base_url and (session.call_id or session.ws is not None):
         try:
             async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT_S) as client:
                 await client.post(
-                    f"{session.base_url}/api/calls/{session.call_id}/end", headers=session.headers
+                    f"{session.base_url}{_call_path(end_path, session.call_id)}", headers=session.headers
                 )
         except Exception:
             pass

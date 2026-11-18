@@ -43,6 +43,7 @@ import {
   MessageSquare,
   Mic,
   Workflow,
+  ChevronDown,
 } from "lucide-react";
 import {
   API_BASE,
@@ -67,6 +68,7 @@ import {
   type RunTargetInput,
   type TestCase,
   type Trace,
+  type VoiceProtocol,
 } from "../lib/api";
 
 const PROVIDERS = [
@@ -75,6 +77,73 @@ const PROVIDERS = [
   { id: "gemini", label: "Gemini", icon: Gem },
   { id: "custom", label: "Custom Endpoint", icon: Plug },
 ];
+
+// The voice protocols the backend supports (app.core.voice_caller), with what each needs
+// in the Endpoint field.
+const VOICE_PROTOCOLS: { id: VoiceProtocol; label: string; hint: string; placeholder: string }[] = [
+  {
+    id: "http_json",
+    label: "HTTP (TTS / STT)",
+    hint: "One HTTP call per turn — AgentShield speaks the audio (TTS in, STT out).",
+    placeholder: "https://<your-ngrok-subdomain>.ngrok.io/voice-chat",
+  },
+  {
+    id: "websocket",
+    label: "WebSocket (TTS / STT)",
+    hint: "The same audio exchange as HTTP, over a ws:// or wss:// connection opened for each turn.",
+    placeholder: "wss://<your-agent-host>/voice",
+  },
+  {
+    id: "native_ws",
+    label: "Native WebSocket",
+    hint: "One persistent WebSocket for the whole scenario, against an agent that speaks its own call-session protocol (e.g. create-a-call + simulated_utterance).",
+    placeholder: "https://<your-agent-host>",
+  },
+];
+
+// Why `text` (an optional advanced field) is not a usable JSON object, or null if it is.
+function jsonObjectError(label: string, text: string): string | null {
+  if (!text.trim()) return null;
+  try {
+    const parsed = JSON.parse(text);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return null;
+  } catch {
+    /* reported below */
+  }
+  return `${label} must be a JSON object, e.g. {"key": "value"}.`;
+}
+
+// One optional text field in the Connect form's Advanced settings.
+function AdvancedField({
+  label,
+  hint,
+  value,
+  onChange,
+  placeholder,
+  multiline = false,
+}: {
+  label: string;
+  hint: string;
+  value: string;
+  onChange: (v: string) => void;
+  placeholder: string;
+  multiline?: boolean;
+}) {
+  const className = "w-full bg-transparent font-mono text-xs text-[#F8FAFC] outline-none placeholder:text-slate-600";
+  return (
+    <div>
+      <label className="text-xs font-medium text-[#9CA3AF]">{label}</label>
+      <div className="mt-2 rounded-lg border border-white/12 bg-white/2 px-4 py-3 transition-colors duration-300 focus-within:border-white/30">
+        {multiline ? (
+          <textarea value={value} onChange={(e) => onChange(e.target.value)} placeholder={placeholder} rows={4} className={`${className} resize-y`} />
+        ) : (
+          <input value={value} onChange={(e) => onChange(e.target.value)} placeholder={placeholder} className={className} />
+        )}
+      </div>
+      <p className="mt-1 text-xs text-slate-500">{hint}</p>
+    </div>
+  );
+}
 
 // Each UI category maps to one of the backend test_type keys.
 const TEST_CATEGORIES = [
@@ -303,13 +372,25 @@ export default function DashboardPage() {
   const [endpointUrl, setEndpointUrl] = useState("http://localhost:8002/chat");
   const [apiKey, setApiKey] = useState("");
   const [provider, setProvider] = useState("openai");
-  // Voice-modality only: which wire protocol the agent speaks. "http_json" (default)
-  // TTS/STTs through the same black-box HTTP adapter chat agents use. "native_ws"
-  // holds one WebSocket open for the whole scenario against a target that speaks its
-  // own call-session protocol directly — createCallBody is the JSON POSTed to create
-  // that call (e.g. {"client": "acme"}), reusing endpoint_url as the HTTP base.
-  const [voiceProtocol, setVoiceProtocol] = useState<"http_json" | "native_ws">("http_json");
+  // Voice-modality only: which wire protocol the agent speaks (see VOICE_PROTOCOLS).
+  // "native_ws" holds one WebSocket open for the whole scenario against a target that
+  // speaks its own call-session protocol directly — createCallBody is the JSON POSTed to
+  // create that call (e.g. {"client": "acme"}), reusing endpoint_url as the HTTP base.
+  const [voiceProtocol, setVoiceProtocol] = useState<VoiceProtocol>("http_json");
   const [createCallBody, setCreateCallBody] = useState("");
+  // Advanced settings — collapsed by default; left as they are, the agent is registered
+  // exactly as before (reply field "reply", the default request body, POST).
+  const [showAdvanced, setShowAdvanced] = useState(false);
+  const [responsePath, setResponsePath] = useState("reply");
+  const [requestTemplate, setRequestTemplate] = useState("");
+  const [httpMethod, setHttpMethod] = useState<"POST" | "GET">("POST");
+  const [queryParamMap, setQueryParamMap] = useState("");
+  const [flowSignals, setFlowSignals] = useState<"auto" | "yes" | "no">("auto");
+  const [protocolConfig, setProtocolConfig] = useState("");
+  // Chat agents and HTTP voice agents both go through the backend's HTTP adapter, so
+  // only they use the reply field, request body and HTTP method.
+  const usesHttpAdapter = modality === "chat" || voiceProtocol === "http_json";
+  const voiceProtocolInfo = VOICE_PROTOCOLS.find((p) => p.id === voiceProtocol) ?? VOICE_PROTOCOLS[0];
   // Knowledge source — all optional, combined: up to MAX_KNOWLEDGE_DOCS uploaded docs +
   // free-text about, any/all/none of them. Auto-discovery is the fallback if nothing
   // was given at all.
@@ -512,6 +593,13 @@ export default function DashboardPage() {
     setApiKey("");
     setVoiceProtocol("http_json");
     setCreateCallBody("");
+    setShowAdvanced(false);
+    setResponsePath("reply");
+    setRequestTemplate("");
+    setHttpMethod("POST");
+    setQueryParamMap("");
+    setFlowSignals("auto");
+    setProtocolConfig("");
     setKnowledgeDocs([]);
     setAboutText("");
     setDetected("");
@@ -630,6 +718,16 @@ export default function DashboardPage() {
       setError("Agent Knowledge is required. Upload a knowledge file or describe your agent.");
       return;
     }
+    const sendsQueryMap = usesHttpAdapter && httpMethod === "GET";
+    const sendsProtocolConfig = modality === "voice" && voiceProtocol === "native_ws";
+    const advancedError =
+      (sendsQueryMap && jsonObjectError("Query parameter map", queryParamMap)) ||
+      (sendsProtocolConfig && jsonObjectError("Protocol config", protocolConfig));
+    if (advancedError) {
+      setShowAdvanced(true);
+      setError(advancedError);
+      return;
+    }
     setError(null);
     setStep("verifying");
     setVerifyIndex(0);
@@ -640,7 +738,7 @@ export default function DashboardPage() {
       const { agent_id } = await registerAgent({
         name: agentName.trim(),
         endpoint_url: endpointUrl.trim(),
-        response_path: "reply",
+        response_path: (usesHttpAdapter && responsePath.trim()) || "reply",
         auth_header: auth,
         description: aboutText.trim() || undefined,
         modality,
@@ -648,7 +746,11 @@ export default function DashboardPage() {
         request_template:
           modality === "voice" && voiceProtocol === "native_ws"
             ? createCallBody.trim()
-            : undefined,
+            : (usesHttpAdapter && requestTemplate.trim()) || undefined,
+        http_method: usesHttpAdapter ? httpMethod : undefined,
+        query_param_map: (sendsQueryMap && queryParamMap.trim()) || undefined,
+        reports_flow_signals: flowSignals === "auto" ? undefined : flowSignals === "yes",
+        protocol_config: (sendsProtocolConfig && protocolConfig.trim()) || undefined,
       });
       setAgentId(agent_id);
       // Store the uploaded docs/YAML on the agent so every later run stays grounded on them.
@@ -1088,7 +1190,7 @@ export default function DashboardPage() {
                       <input
                         value={endpointUrl}
                         onChange={(e) => setEndpointUrl(e.target.value)}
-                        placeholder={modality === "voice" ? "https://<your-ngrok-subdomain>.ngrok.io/voice-chat" : "https://api.example.com/v1/agent"}
+                        placeholder={modality === "voice" ? voiceProtocolInfo.placeholder : "https://api.example.com/v1/agent"}
                         className="w-full bg-transparent text-sm text-[#F8FAFC] outline-none placeholder:text-slate-600"
                       />
                     </div>
@@ -1097,13 +1199,8 @@ export default function DashboardPage() {
                   {modality === "voice" && (
                     <div>
                       <label className="text-xs font-medium text-[#9CA3AF]">Voice Protocol</label>
-                      <div className="mt-2 grid grid-cols-2 gap-3">
-                        {(
-                          [
-                            { id: "http_json" as const, label: "HTTP (TTS / STT)" },
-                            { id: "native_ws" as const, label: "Native WebSocket" },
-                          ]
-                        ).map((p) => {
+                      <div className="mt-2 grid grid-cols-3 gap-3">
+                        {VOICE_PROTOCOLS.map((p) => {
                           const active = voiceProtocol === p.id;
                           return (
                             <button
@@ -1118,11 +1215,7 @@ export default function DashboardPage() {
                           );
                         })}
                       </div>
-                      <p className="mt-2 text-xs text-slate-500">
-                        {voiceProtocol === "http_json"
-                          ? "One HTTP call per turn — AgentShield speaks the audio (TTS in, STT out)."
-                          : "One persistent WebSocket for the whole scenario, against an agent that speaks its own call-session protocol (e.g. create-a-call + simulated_utterance)."}
-                      </p>
+                      <p className="mt-2 text-xs text-slate-500">{voiceProtocolInfo.hint}</p>
 
                       {voiceProtocol === "native_ws" && (
                         <div className="mt-3">
@@ -1137,7 +1230,7 @@ export default function DashboardPage() {
                             />
                           </div>
                           <p className="mt-1 text-xs text-slate-500">
-                            POSTed to {"{"}Endpoint URL{"}"}/api/calls to create the call; the returned call_id opens the WebSocket at {"{"}Endpoint URL, ws(s)://{"}"}/api/ws/{"{"}call_id{"}"}.
+                            By default POSTed to {"{"}Endpoint URL{"}"}/api/calls to create the call; the returned call_id opens the WebSocket at {"{"}Endpoint URL, ws(s)://{"}"}/api/ws/{"{"}call_id{"}"}. A different format can be set in Advanced Settings below.
                           </p>
                         </div>
                       )}
@@ -1150,6 +1243,110 @@ export default function DashboardPage() {
                       <KeyRound className="h-4 w-4 shrink-0 text-slate-400" strokeWidth={1.5} />
                       <input value={apiKey} onChange={(e) => setApiKey(e.target.value)} type="password" placeholder="sent as Authorization: Bearer …" className="w-full bg-transparent text-sm text-[#F8FAFC] outline-none placeholder:text-slate-600" />
                     </div>
+                  </div>
+
+                  <div className="rounded-lg border border-white/10 bg-white/2">
+                    <button
+                      type="button"
+                      onClick={() => setShowAdvanced((v) => !v)}
+                      aria-expanded={showAdvanced}
+                      className="flex w-full items-center gap-3 px-4 py-3 text-left text-xs font-medium text-[#9CA3AF] transition-colors hover:text-[#F8FAFC]"
+                    >
+                      <SlidersHorizontal className="h-4 w-4 shrink-0" strokeWidth={1.5} />
+                      <span className="flex-1">
+                        Advanced Settings <span className="text-slate-600">(optional — the defaults work for most agents)</span>
+                      </span>
+                      <ChevronDown className={`h-4 w-4 transition-transform ${showAdvanced ? "rotate-180" : ""}`} />
+                    </button>
+
+                    {showAdvanced && (
+                      <div className="flex flex-col gap-5 border-t border-white/10 px-4 py-5">
+                        {usesHttpAdapter && (
+                          <>
+                            <AdvancedField
+                              label="Reply field"
+                              hint="Where the reply is in the agent's JSON response. Use dots for nested fields, e.g. data.answer or choices.0.text."
+                              value={responsePath}
+                              onChange={setResponsePath}
+                              placeholder="reply"
+                            />
+                            <div>
+                              <label className="text-xs font-medium text-[#9CA3AF]">HTTP Method</label>
+                              <div className="mt-2 grid grid-cols-2 gap-3">
+                                {(["POST", "GET"] as const).map((m) => (
+                                  <button
+                                    key={m}
+                                    type="button"
+                                    onClick={() => setHttpMethod(m)}
+                                    className={`rounded-lg border px-3 py-2 text-xs font-medium transition-all duration-300 ${
+                                      httpMethod === m ? "border-white/50 bg-white/10 text-[#F8FAFC]" : "border-white/10 bg-white/2 text-slate-400 hover:border-white/20 hover:text-[#F8FAFC]"
+                                    }`}
+                                  >
+                                    {m}
+                                  </button>
+                                ))}
+                              </div>
+                            </div>
+                            {httpMethod === "POST" ? (
+                              <AdvancedField
+                                label="Request body template"
+                                hint="The JSON sent each turn. {message}, {history} and {faults} are filled in. Leave empty for the default shown."
+                                value={requestTemplate}
+                                onChange={setRequestTemplate}
+                                placeholder={'{"message":"{message}","history":{history},"faults":{faults}}'}
+                                multiline
+                              />
+                            ) : (
+                              <AdvancedField
+                                label="Query parameter map (JSON)"
+                                hint='Which query parameter carries each value, e.g. {"message": "q"}. A value left out is not sent. Leave empty to send message, history and faults under those names.'
+                                value={queryParamMap}
+                                onChange={setQueryParamMap}
+                                placeholder={'{"message": "q"}'}
+                              />
+                            )}
+                          </>
+                        )}
+
+                        {modality === "voice" && voiceProtocol === "native_ws" && (
+                          <AdvancedField
+                            label="Protocol config (JSON)"
+                            hint="Only the parts of the WebSocket protocol that differ from the default, e.g. paths, field names, message types. Leave empty for the default."
+                            value={protocolConfig}
+                            onChange={setProtocolConfig}
+                            placeholder={'{"ws_path": "/v1/stream/{call_id}", "text_path": "payload.text"}'}
+                            multiline
+                          />
+                        )}
+
+                        <div>
+                          <label className="text-xs font-medium text-[#9CA3AF]">Reports flow signals</label>
+                          <div className="mt-2 grid grid-cols-3 gap-3">
+                            {(
+                              [
+                                { id: "auto" as const, label: "Detect automatically" },
+                                { id: "yes" as const, label: "Yes" },
+                                { id: "no" as const, label: "No" },
+                              ]
+                            ).map((o) => (
+                              <button
+                                key={o.id}
+                                type="button"
+                                onClick={() => setFlowSignals(o.id)}
+                                className={`rounded-lg border px-3 py-2 text-xs font-medium transition-all duration-300 ${
+                                  flowSignals === o.id ? "border-white/50 bg-white/10 text-[#F8FAFC]" : "border-white/10 bg-white/2 text-slate-400 hover:border-white/20 hover:text-[#F8FAFC]"
+                                }`}
+                              >
+                                {o.label}
+                              </button>
+                            ))}
+                          </div>
+                          <p className="mt-1 text-xs text-slate-500">
+                            Whether the agent reports its answers, interrupt keys and end status. With Yes, a missing one counts against it in interrupt tests. Detect automatically keeps any setting saved earlier.
+                          </p>
+                        </div>
+                      </div>
+                    )}
                   </div>
 
                   <div>

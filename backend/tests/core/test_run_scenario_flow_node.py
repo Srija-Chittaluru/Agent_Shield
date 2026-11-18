@@ -81,7 +81,7 @@ class _FakeSendAgent:
             "message": message, "history": list(history), "faults": list(faults),
             "session_key": session_key, "is_last_turn": is_last_turn,
         })
-        reply = self._replies.pop(0) if self._replies else runner._AGENT_ERROR_SENTINEL
+        reply = self._replies.pop(0) if self._replies else runner.AGENT_ERROR_SENTINEL
         return {"reply": reply, "trace": {}}
 
 
@@ -242,7 +242,7 @@ async def test_flow_node_scenario_fails_cleanly_when_the_opening_turn_cannot_be_
     transcript = fake_db.messages[conv_id]
     assert len(transcript) == 1
     assert transcript[0]["role"] == "agent"
-    assert transcript[0]["content"] == runner._AGENT_ERROR_SENTINEL
+    assert transcript[0]["content"] == runner.AGENT_ERROR_SENTINEL
     assert send_fn.calls == []  # the caller line was never sent
 
 

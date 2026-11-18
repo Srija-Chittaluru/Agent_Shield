@@ -2,7 +2,7 @@
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from app.core.adapter import DEFAULT_REQUEST_TEMPLATE
+from app.core.adapter import AGENT_ERROR_SENTINEL, DEFAULT_REQUEST_TEMPLATE
 from app.db import (
     get_agent,
     get_agent_by_name_and_endpoint,
@@ -171,7 +171,7 @@ async def probe(agent_id: int) -> dict:
 
     reply = result.get("reply", "")
     trace = result.get("trace", {}) or {}
-    ok = reply != "<error>" and not trace.get("error")
+    ok = reply != AGENT_ERROR_SENTINEL and not trace.get("error")
     return {"ok": ok, "reply": reply[:300], "error": trace.get("error")}
 
 

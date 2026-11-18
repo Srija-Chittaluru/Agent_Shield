@@ -162,7 +162,7 @@ async def test_flow_scenario_fails_cleanly_if_the_opening_turn_cannot_be_fetched
     agent = _Agent([])
     conv = await _run(_flow_path_scenario(8), agent, greeting=broken)
     assert agent.sent == []
-    assert fake_db.messages[conv][0]["content"] == runner._AGENT_ERROR_SENTINEL
+    assert fake_db.messages[conv][0]["content"] == runner.AGENT_ERROR_SENTINEL
 
 
 @pytest.fixture

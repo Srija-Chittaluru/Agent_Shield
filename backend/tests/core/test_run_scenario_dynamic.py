@@ -99,7 +99,7 @@ class _FakeSendAgent:
             "message": message, "history": list(history), "faults": list(faults),
             "session_key": session_key, "is_last_turn": is_last_turn,
         })
-        reply = self._replies.pop(0) if self._replies else runner._AGENT_ERROR_SENTINEL
+        reply = self._replies.pop(0) if self._replies else runner.AGENT_ERROR_SENTINEL
         return {"reply": reply, "trace": {}}
 
 
@@ -230,7 +230,7 @@ async def test_transport_failure_stops_the_dynamic_loop(monkeypatch, fake_db):
         run_id=1, scenario=_dynamic_scenario(max_turns=8), agent={"id": 1}, send_fn=send_fn,
     )
     transcript = fake_db.messages[conv_id]
-    assert transcript[-1]["content"] == runner._AGENT_ERROR_SENTINEL
+    assert transcript[-1]["content"] == runner.AGENT_ERROR_SENTINEL
     assert len(caller.calls) == 1  # did not keep generating caller lines against a dead session
 
 

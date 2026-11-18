@@ -365,7 +365,7 @@ async def test_unmapped_call_variable_places_no_call_and_says_why(fake_db, monke
     conv = await _run(_flow_path(["x"]), agent=agent)
     assert calls_log == []  # nothing was created
     last = fake_db.messages[conv][-1]
-    assert last["content"] == runner._AGENT_ERROR_SENTINEL and "not mapped" in last["trace"]["error"]
+    assert last["content"] == runner.AGENT_ERROR_SENTINEL and "not mapped" in last["trace"]["error"]
 
 
 def test_activities_attach_call_variables_only_when_present():

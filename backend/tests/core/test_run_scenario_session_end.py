@@ -23,7 +23,7 @@ from app.core.node_script import path_script_to_scenario
 from tests.core.fakes_llm import passthrough_chat
 from tests.core.fakes_native_ws import FakeAsyncClient, FakeConnect, FakeWebSocket, turn_frame
 
-SENTINEL = runner._AGENT_ERROR_SENTINEL
+SENTINEL = runner.AGENT_ERROR_SENTINEL
 
 
 class _FakeDB:

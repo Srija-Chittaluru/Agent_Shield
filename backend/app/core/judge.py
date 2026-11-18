@@ -8,7 +8,7 @@ import json
 from typing import Any
 
 from app.core import flow_oracle
-from app.core.adapter import SYSTEM_FAULTS
+from app.core.adapter import AGENT_ERROR_SENTINEL, SYSTEM_FAULTS
 from app.core.llm import FIXED_SEED, chat
 from app.core.node_script import parse_plain_path_script
 from app.db import (
@@ -21,10 +21,6 @@ from app.db import (
 
 VALID_SEVERITY = {"low", "med", "high"}
 VALID_CATEGORY = {"accuracy", "safety", "hallucination", "recovery", "system"}
-
-# The sentinel app.core.adapter.send() returns when a turn produced no usable reply —
-# connection refused, bad status, timeout, unparseable body. It is not agent output.
-AGENT_ERROR_SENTINEL = "<error>"
 
 # Severity of each simulated system fault.
 _SYSTEM_SEVERITY = {

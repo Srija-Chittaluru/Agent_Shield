@@ -319,7 +319,7 @@ def normalize_explicit_edges(raw_edges: list, seen_ids: set[str]) -> tuple[list[
 # Deliberately NOT read: step adjacency where no transition is declared (no implicit
 # fall-through), `transfer` blocks, and anything inferred from `when` text, names or
 # descriptions. The flow-level `interrupts:` list is normalized separately — never
-# as edges — by modular_interrupts() below.
+# as edges — by parse_interrupts() below, for this format and every other one.
 # ---------------------------------------------------------------------------
 ADVANCE = "advance"
 RESUME = "resume"
@@ -461,8 +461,9 @@ def modular_step_transitions(
 END = "end"
 
 
-def modular_interrupts(raw: dict, step_ids: set[str]) -> tuple[list[dict], list[str]]:
-    """(interrupts, errors) for a modular step flow's top-level `interrupts:` list.
+def parse_interrupts(raw: dict, step_ids: set[str]) -> tuple[list[dict], list[str]]:
+    """(interrupts, errors) for a flow's top-level `interrupts:` list — in any flow format
+    (the modular step format's interrupt shape, which any flow may use).
 
     Interrupts are events the caller can raise at any point in the call — the file
     never ties them to particular steps — so they are NOT edges. Each is normalized to:
@@ -653,7 +654,6 @@ def parse_flow(source_text: str, source_format: Optional[str] = None) -> dict:
     # ... plus per-node transitions: for a modular step flow, every form that format
     # declares (see modular_step_transitions); otherwise the lenient inline hints
     # (next/goto/...), never inferred from ordering — see _extract_inline_edges.
-    interrupts = None
     if explicit_nodes is None and is_modular_step_flow(raw) and raw_node_items is raw["steps"]:
         inline_edges, controls, transition_errors = modular_step_transitions(raw, nodes)
         errors.extend(transition_errors)
@@ -669,11 +669,13 @@ def parse_flow(source_text: str, source_format: Optional[str] = None) -> dict:
                 node["field"] = {"key": field["key"].strip()}
                 if isinstance(field.get("save_to"), str):
                     node["field"]["save_to"] = field["save_to"]
-        if "interrupts" in raw:
-            interrupts, interrupt_errors = modular_interrupts(raw, seen_ids)
-            errors.extend(interrupt_errors)
     else:
         inline_edges = _extract_inline_edges(raw_node_items, nodes)
+    # Interrupts are declared the same way in every format: a top-level `interrupts:` list.
+    interrupts = None
+    if "interrupts" in raw:
+        interrupts, interrupt_errors = parse_interrupts(raw, seen_ids)
+        errors.extend(interrupt_errors)
     seen_pairs = {(e["from"], e["to"]) for e in explicit_edges}
     edges = explicit_edges + [e for e in inline_edges if (e["from"], e["to"]) not in seen_pairs]
 
@@ -687,8 +689,8 @@ def parse_flow(source_text: str, source_format: Optional[str] = None) -> dict:
         "source_format": detected_format,
         "extraction_method": "deterministic",
     }
-    # Only a modular step flow that declares `interrupts:` gets this key; every other
-    # flow's result is exactly as before.
+    # Only a flow that declares `interrupts:` gets this key; every other flow's result is
+    # exactly as before.
     if interrupts is not None:
         result["interrupts"] = interrupts
     return result

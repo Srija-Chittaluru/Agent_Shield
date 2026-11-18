@@ -1,5 +1,5 @@
 """Tests for interrupt normalization in the modular step flow adapter
-(app.core.flow_parser.modular_interrupts): the top-level `interrupts:` list becomes a
+(app.core.flow_parser.parse_interrupts): the top-level `interrupts:` list becomes a
 separate `interrupts` list in the parse result — never edges.
 """
 import json
@@ -178,30 +178,48 @@ def test_malformed_interrupts_are_rejected(interrupts, needle):
 # ---------------------------------------------------------------------------
 # Other formats are untouched
 # ---------------------------------------------------------------------------
-def test_generic_flow_with_an_interrupts_key_is_unchanged():
-    # Not the modular shape (no entry/kind): `interrupts` is ignored, as before.
+def test_generic_flow_with_an_interrupts_key_gets_its_interrupts():
+    # Not the modular shape (no entry/kind): its graph is read as before, and its
+    # `interrupts` are read the same way as a modular flow's.
     r = parse_flow(json.dumps({
         "nodes": [{"id": "a", "name": "A"}, {"id": "b", "name": "B"}],
         "edges": [{"from": "a", "to": "b"}],
         "interrupts": [{"key": "h", "resume": "goto:b"}],
     }), "json")
-    assert set(r) == {"agent_name", "nodes", "edges", "source_format", "extraction_method"}
     assert r["edges"] == [{"from": "a", "to": "b"}]
+    assert r["interrupts"] == [{"id": "h", "outcome": "goto", "target": "b"}]
 
 
-def test_generic_steps_flow_is_unchanged():
+def test_generic_flow_without_interrupts_is_unchanged():
+    r = parse_flow(json.dumps({
+        "nodes": [{"id": "a", "name": "A"}, {"id": "b", "name": "B"}],
+        "edges": [{"from": "a", "to": "b"}],
+    }), "json")
+    assert set(r) == {"agent_name", "nodes", "edges", "source_format", "extraction_method"}
+
+
+def test_generic_flow_interrupts_are_validated_like_modular_ones():
+    with pytest.raises(FlowParseError) as e:
+        parse_flow(json.dumps({
+            "nodes": [{"id": "a", "name": "A"}],
+            "interrupts": [{"key": "h", "resume": "goto:nowhere"}],
+        }), "json")
+    assert "interrupt 'h': resume points to unknown step 'nowhere'." in e.value.errors
+
+
+def test_generic_steps_flow_keeps_its_edges_and_gets_its_interrupts():
     r = parse_flow(yaml.safe_dump({"steps": [{"id": "a", "name": "A", "next": "b"}, {"id": "b", "name": "B"}],
                                    "interrupts": [{"key": "h", "resume": "goto:b"}]}), "yaml")
-    assert "interrupts" not in r
+    assert r["interrupts"] == [{"id": "h", "outcome": "goto", "target": "b"}]
     assert r["edges"] == [{"from": "a", "to": "b"}]
 
 
 def test_interrupt_descriptions_are_kept_for_detection_by_meaning():
-    from app.core.flow_parser import modular_interrupts
+    from app.core.flow_parser import parse_interrupts
     raw = {"interrupts": [{"key": "bereavement", "resume": "end",
                            "reader_description": "the caller says the patient\n  has died",
                            "description": "the patient has died"}]}
-    items, errors = modular_interrupts(raw, set())
+    items, errors = parse_interrupts(raw, set())
     assert errors == []
     assert items[0]["reader_description"] == "the caller says the patient has died"
     assert items[0]["description"] == "the patient has died"

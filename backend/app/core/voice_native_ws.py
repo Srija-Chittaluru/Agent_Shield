@@ -69,11 +69,13 @@ from typing import Any, Optional
 import httpx
 import websockets
 
-from app.core.adapter import DEFAULT_TIMEOUT_S, _extract_by_path, _render_body
-
-# Matches app.core.judge.AGENT_ERROR_SENTINEL / app.core.voice_caller.AGENT_ERROR_SENTINEL
-# exactly — kept as a literal, same tradeoff already made in twilio_bridge.py.
-AGENT_ERROR_SENTINEL = "<error>"
+from app.core.adapter import (
+    AGENT_ERROR_SENTINEL,
+    DEFAULT_TIMEOUT_S,
+    _extract_by_path,
+    _render_body,
+    auth_headers,
+)
 
 # When one exchange's agent output counts as finished, so the caller may speak (see
 # _read_agent_output). The agent composes a consecutive turn while its previous line is
@@ -230,20 +232,11 @@ def _ws_url(base_url: str, path: str) -> str:
     return f"{ws_base.rstrip('/')}{path}"
 
 
-def _auth_headers(agent: Any) -> dict[str, str]:
-    headers: dict[str, str] = {}
-    if agent.get("auth_header"):
-        name, _, value = agent["auth_header"].partition(":")
-        if name and value:
-            headers[name.strip()] = value.strip()
-    return headers
-
-
 def _call_headers(agent: Any, body: dict, config: dict) -> dict[str, str]:
     """Headers for the target's HTTP calls: the auth header, plus the tenant header
     naming the client the call is for (by default X-Tenant from the create-call body's
     "client" field — the original target rejects POST /api/calls without it)."""
-    headers = _auth_headers(agent)
+    headers = auth_headers(agent)
     tenant = body.get(config["tenant_field"]) if config["tenant_field"] else None
     if config["tenant_header"] and isinstance(tenant, str) and tenant.strip():
         headers[config["tenant_header"]] = tenant.strip()

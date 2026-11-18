@@ -69,13 +69,8 @@ from twilio.rest import Client as TwilioClient
 from twilio.twiml.voice_response import Connect, Stream, VoiceResponse
 
 from app.config import PUBLIC_BASE_URL, TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_FROM_NUMBER
+from app.core.adapter import AGENT_ERROR_SENTINEL
 from app.core.llm import speech_to_text, text_to_speech
-
-# Matches app.core.judge.AGENT_ERROR_SENTINEL / app.core.voice_caller.AGENT_ERROR_SENTINEL
-# exactly. Duplicated as a literal rather than imported, same tradeoff already made
-# between judge.py and voice_caller.py — importing from voice_caller.py here would be
-# circular (voice_caller dispatches INTO this module).
-AGENT_ERROR_SENTINEL = "<error>"
 
 # --- Telephony / timing constants (POC-tuned, not production-calibrated) -----
 SAMPLE_RATE_HZ = 8000                       # Twilio Media Streams' fixed rate

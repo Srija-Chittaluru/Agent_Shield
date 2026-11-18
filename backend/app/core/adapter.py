@@ -27,6 +27,12 @@ from app.db import (
     update_agent_description,
 )
 
+# The reply a turn gets when the agent produced no usable reply — connection refused, bad
+# status, timeout, unparseable body, or a failed voice transport. It is not agent output:
+# the Judge scores it as a system failure. Defined here once; every transport and check
+# imports it.
+AGENT_ERROR_SENTINEL = "<error>"
+
 # The standard request template for our sample RAG agent. Placeholders:
 #   {message} -> JSON-escaped string (sits inside quotes)
 #   {history} -> JSON array          (no quotes)
@@ -92,6 +98,16 @@ def _render_query_params(param_map: dict, message: str, history: list, faults: l
     }
 
 
+def auth_headers(agent: Any) -> dict[str, str]:
+    """The agent's `auth_header` — stored as one "Header: value" string — as a headers
+    dict. Empty when unset or without both a name and a value. Shared by every transport."""
+    raw = agent.get("auth_header")
+    if not raw:
+        return {}
+    name, _, value = raw.partition(":")
+    return {name.strip(): value.strip()} if name and value else {}
+
+
 def _extract_by_path(data: Any, dot_path: str) -> Any:
     """Walk a dot-path like 'reply' or 'data.choices.0.text' through dicts/lists."""
     cur = data
@@ -128,7 +144,7 @@ async def send(
     sys_fault = next((f for f in faults if f in SYSTEM_FAULTS), None)
     if sys_fault:
         return {
-            "reply": "<error>",
+            "reply": AGENT_ERROR_SENTINEL,
             "trace": {"error": _SYSTEM_FAULT_TRACE[sys_fault], "system_fault": sys_fault, "latency_ms": 0, "tokens": 0},
         }
 
@@ -138,12 +154,7 @@ async def send(
     response_path = agent.get("response_path") or "reply"
     url = agent.get("endpoint_url")
     http_method = (agent.get("http_method") or "POST").upper()
-    headers = {"content-type": "application/json"}
-    if agent.get("auth_header"):
-        # Stored as a single "Header: value" string.
-        name, _, value = agent["auth_header"].partition(":")
-        if name and value:
-            headers[name.strip()] = value.strip()
+    headers = {"content-type": "application/json", **auth_headers(agent)}
 
     try:
         async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT_S) as client:
@@ -162,11 +173,11 @@ async def send(
             resp.raise_for_status()
             data = resp.json()
     except httpx.TimeoutException:
-        return {"reply": "<error>", "trace": {"error": "timeout"}}
+        return {"reply": AGENT_ERROR_SENTINEL, "trace": {"error": "timeout"}}
     except httpx.HTTPStatusError as e:
-        return {"reply": "<error>", "trace": {"error": f"http {e.response.status_code}"}}
+        return {"reply": AGENT_ERROR_SENTINEL, "trace": {"error": f"http {e.response.status_code}"}}
     except Exception as e:  # connection refused, bad JSON, etc.
-        return {"reply": "<error>", "trace": {"error": str(e)}}
+        return {"reply": AGENT_ERROR_SENTINEL, "trace": {"error": str(e)}}
 
     reply = _extract_by_path(data, response_path)
     if reply is None:

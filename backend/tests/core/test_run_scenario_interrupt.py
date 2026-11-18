@@ -30,7 +30,7 @@ from tests.routers.test_flow_interrupt_scripts import INTERRUPTS, KINDS, READBAC
 
 from app.core.node_script import validate_interrupt_script
 
-SENTINEL = runner._AGENT_ERROR_SENTINEL
+SENTINEL = runner.AGENT_ERROR_SENTINEL
 GRAPH = {"nodes": PARSED["nodes"], "edges": PARSED["edges"]}
 PLAN = {s["interrupt"]["id"]: s for s in R._interrupt_scenarios(GRAPH, INTERRUPTS)[1]}
 NAMES = {n["id"]: n.get("name") or n["id"] for n in PARSED["nodes"]}

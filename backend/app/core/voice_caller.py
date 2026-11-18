@@ -31,7 +31,7 @@ Currently implemented:
 
 Failure handling deliberately mirrors app.core.adapter.send(): any failure (TTS, the
 transport call itself, STT, or an unsupported/unknown protocol) resolves to the SAME
-sentinel app.core.judge.AGENT_ERROR_SENTINEL ("<error>") that a transport failure
+sentinel app.core.adapter.AGENT_ERROR_SENTINEL ("<error>") that a transport failure
 already produces for a chat agent, so the existing judge._endpoint_never_responded() /
 _record_system_failure() machinery scores it exactly like an unreachable chat agent —
 no new failure category for the Judge to learn.
@@ -43,13 +43,8 @@ from typing import Any, Optional
 
 import websockets
 
-from app.core.adapter import DEFAULT_TIMEOUT_S, send as http_send
+from app.core.adapter import AGENT_ERROR_SENTINEL, DEFAULT_TIMEOUT_S, auth_headers, send as http_send
 from app.core.llm import speech_to_text, text_to_speech
-
-# Matches app.core.judge.AGENT_ERROR_SENTINEL exactly — kept as a literal (not an
-# import) to avoid a runner/activities -> judge import for a single string constant;
-# judge.py's copy is the canonical one and asserts against this same value.
-AGENT_ERROR_SENTINEL = "<error>"
 
 # Protocols recognized by name but with no transport implementation yet. Kept apart
 # from a genuinely unknown/typo'd value so the two fail with distinguishable messages.
@@ -284,11 +279,7 @@ async def _call_via_websocket(
     except Exception as e:
         return {"reply": AGENT_ERROR_SENTINEL, "trace": {"error": f"tts error: {e}"}}
 
-    headers: dict[str, str] = {}
-    if agent.get("auth_header"):
-        name, _, value = agent["auth_header"].partition(":")
-        if name and value:
-            headers[name.strip()] = value.strip()
+    headers = auth_headers(agent)
 
     request = {
         "type": "audio",

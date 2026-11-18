@@ -3,7 +3,7 @@ what the agent does by probing it with a few neutral questions and summarizing t
 """
 from typing import Any
 
-from app.core.adapter import send
+from app.core.adapter import AGENT_ERROR_SENTINEL, send
 from app.core.llm import chat
 
 # Neutral, domain-agnostic probes. We only look at HOW/WHAT the agent answers.
@@ -33,7 +33,7 @@ async def discover_agent(agent: Any) -> str:
         try:
             r = await send(agent, probe, history, [])
             reply = r.get("reply", "")
-            if reply and reply != "<error>":
+            if reply and reply != AGENT_ERROR_SENTINEL:
                 replies.append(f"Q: {probe}\nA: {reply}")
                 history.append({"role": "user", "content": probe})
                 history.append({"role": "assistant", "content": reply})

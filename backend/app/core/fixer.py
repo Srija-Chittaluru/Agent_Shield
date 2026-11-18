@@ -42,8 +42,8 @@ _SYSTEM_FIX = {
     ),
 }
 
-SYSTEM_PROMPT = """You are an AI reliability engineer. A customer-support agent FAILED a test.
-Given the scenario, the transcript, the per-turn trace, and the judge's verdict, produce a
+SYSTEM_PROMPT = """You are an AI reliability engineer. An AI agent FAILED a test.
+Given what the agent does (when known), the scenario, the transcript, the per-turn trace, and the judge's verdict, produce a
 crisp root-cause and a single pasteable fix. Respond in json only.
 
 Rules:
@@ -84,6 +84,7 @@ async def explain_and_fix(conversation: Any) -> dict:
     trace_text = json.dumps(traces, indent=2)[:3000]
 
     user = (
+        f"{_agent_block(conv)}"
         f"SCENARIO\n  test_type: {scenario.get('test_type')}\n"
         f"  assigned_fault: {scenario.get('assigned_fault')}\n"
         f"  expected_behavior: {scenario.get('expected_behavior')}\n\n"
@@ -121,6 +122,12 @@ async def explain_and_fix(conversation: Any) -> dict:
 
     update_conversation_fix(conv_id, explanation, suggested_fix, evidence)
     return {"explanation": explanation, "suggested_fix": suggested_fix, "evidence": evidence}
+
+
+def _agent_block(conv: dict) -> str:
+    from app.core.judge import _agent_block as judge_agent_block
+
+    return judge_agent_block(conv)
 
 
 def _is_interrupt_scenario(scenario: dict) -> bool:

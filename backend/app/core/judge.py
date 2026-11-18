@@ -34,10 +34,11 @@ _SYSTEM_SEVERITY = {
     "malformed_response": "med",
 }
 
-SYSTEM_PROMPT = """You are a strict evaluator of AI customer-support agents. You judge ONE
+SYSTEM_PROMPT = """You are a strict evaluator of AI agents. You judge ONE
 conversation and respond in json only.
 
-You are given the scenario (goal, expected_behavior, assigned_fault), the full transcript,
+You are given what the agent under test does (when known — judge it against ITS purpose,
+not against any other kind of agent), the scenario (goal, expected_behavior, assigned_fault), the full transcript,
 and the agent's per-turn trace (tool calls, retrieved docs incl. a `stale` flag).
 
 IMPORTANT — honest declines are CORRECT, not failures. If the agent honestly says it does not
@@ -73,10 +74,10 @@ irrelevant category:
 - hallucination: driven by hallucination (did it invent/parrot a wrong fact?).
 - tool_timeout: driven by recovery/graceful handling (see the CRITICAL note above).
 - happy_path: driven by accuracy, but accuracy here means the WHOLE interaction, not one
-  fact: did the agent correctly UNDERSTAND what the customer wanted, actually COMPLETE the
+  fact: did the agent correctly UNDERSTAND what the user wanted, actually COMPLETE the
   task (collect what it needed, take the right action — not stall, loop, or hand back an
   incomplete result), and END the conversation appropriately (confirm what was done, close
-  out naturally, not leave it hanging)? A cooperative customer gave it everything it asked
+  out naturally, not leave it hanging)? A cooperative user gave it everything it asked
   for — a happy_path scenario should only fail if the agent itself dropped the ball.
 
 Then decide:
@@ -307,18 +308,39 @@ def _interrupt_plan(scenario: dict) -> dict | None:
 FLOW_SIGNAL_FIELDS = ("answers", "interrupt_key", "end_status")
 
 
+def _conversation_agent(conv: dict) -> dict | None:
+    """The agent a conversation was run against (via its run), or None if unknown."""
+    try:
+        run = get_run(conv["run_id"]) if conv.get("run_id") is not None else None
+        agent = get_agent(dict(run)["agent_id"]) if run else None
+    except Exception:
+        return None
+    return dict(agent) if agent else None
+
+
+# Cap on the agent description given to the Judge and the fixer, so an auto-discovered
+# description never crowds out the transcript.
+AGENT_DESCRIPTION_MAX_CHARS = 1000
+
+
+def _agent_block(conv: dict) -> str:
+    """'AGENT UNDER TEST' prompt section — what the agent does, from its saved description —
+    or "" when it has none, so such a conversation's prompt is unchanged."""
+    agent = _conversation_agent(conv)
+    description = str((agent or {}).get("description") or "").strip()
+    if not description:
+        return ""
+    return f"AGENT UNDER TEST\n  {description[:AGENT_DESCRIPTION_MAX_CHARS]}\n\n"
+
+
 def _reports_flow_signals(conv: dict, traces: list[dict]) -> bool:
     """Whether the agent reports flow signals at all, so a missing interrupt key or end
     status is evidence rather than silence. Never inferred from the agent's protocol.
 
     The agent's own `reports_flow_signals` setting decides when it is set. Unset, this
     conversation's trace decides: any agent turn carrying a FLOW_SIGNAL_FIELDS field."""
-    try:
-        run = get_run(conv["run_id"]) if conv.get("run_id") is not None else None
-        agent = get_agent(dict(run)["agent_id"]) if run else None
-    except Exception:
-        agent = None
-    setting = dict(agent).get("reports_flow_signals") if agent else None
+    agent = _conversation_agent(conv)
+    setting = agent.get("reports_flow_signals") if agent else None
     if setting is not None:
         return bool(setting)
     return any(isinstance(t, dict) and t.get(f) for t in traces for f in FLOW_SIGNAL_FIELDS)
@@ -601,6 +623,7 @@ async def judge_conversation(conversation: Any) -> dict:
         transcript_text = "\n".join(f"[turn {m['turn_index']}] {m['role']}: {m['content']}" for m in msgs)
 
     user = (
+        f"{_agent_block(conv)}"
         f"SCENARIO\n  goal: {scenario.get('user_goal')}\n"
         f"  expected_behavior: {scenario.get('expected_behavior')}\n"
         f"  test_type: {scenario.get('test_type')}\n"

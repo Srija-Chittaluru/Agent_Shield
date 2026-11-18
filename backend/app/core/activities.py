@@ -102,7 +102,7 @@ async def prepare_scenarios(
 
     # Generate scenarios (falls back to a hardcoded bank on LLM failure).
     scenarios = await generate_scenarios(
-        description or "A customer-support agent.",
+        description or "An AI agent.",
         selected_types,
         guidance,
         knowledge,

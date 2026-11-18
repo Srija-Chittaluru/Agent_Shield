@@ -550,8 +550,8 @@ def _stored_script(script_json: str | None) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Interrupt scenarios (whole-flow planning): a modular flow's stored raw source is
-# re-parsed deterministically to recover its interrupts, then planned by
+# Interrupt scenarios (whole-flow planning): a flow's stored raw source is re-parsed
+# deterministically to recover its interrupts (any format may declare them), then planned by
 # app.core.flow_scenario_planner. Scripts: _generate_interrupt_draft / _save_interrupt_script;
 # runs: _run_interrupt_scenario.
 # ---------------------------------------------------------------------------
@@ -560,29 +560,31 @@ INTERRUPT_NO_SCRIPT = "Interrupt scenarios do not support script generation yet.
 INTERRUPT_NO_RUN = "This interrupt scenario has no saved script — generate and save one before running."
 
 
-def _modular_source(flow: dict) -> bool:
-    """True iff this stored flow's raw source is a modular step flow that may be
-    re-parsed deterministically. Never for an LLM-extracted flow: re-parsing it would
+def _plans_interrupts(flow: dict) -> bool:
+    """True iff this stored flow's raw source may be re-parsed deterministically for
+    interrupt planning: a modular step flow, or a flow in any other format that declares
+    a top-level `interrupts:` list. Never for an LLM-extracted flow: re-parsing it would
     call the LLM again."""
     if (flow.get("extraction_method") or "deterministic") == "llm" or not flow.get("raw_source"):
         return False
     try:
-        return is_modular_step_flow(yaml.safe_load(flow["raw_source"]))
+        raw = yaml.safe_load(flow["raw_source"])
     except yaml.YAMLError:
         return False
+    return is_modular_step_flow(raw) or (isinstance(raw, dict) and "interrupts" in raw)
 
 
 def _load_planning_graph(flow_id: int) -> tuple[dict, dict, list | None]:
     """(flow row, graph, interrupts) for whole-flow planning.
 
-    Not a modular flow: the stored graph, interrupts None — exactly what every endpoint
-    used before. Modular flow: a fresh deterministic parse of the stored raw source,
+    A flow that plans no interrupts (see _plans_interrupts): the stored graph, interrupts
+    None — exactly what every endpoint used before. Otherwise: a fresh deterministic parse of the stored raw source,
     which must describe the SAME graph as the stored one (same node ids in order, same
     edges in order); otherwise 409 rather than planning against a different graph.
     Nothing is written.
     """
     flow, stored = _load_flow_graph(flow_id)
-    if not _modular_source(flow):
+    if not _plans_interrupts(flow):
         return flow, stored, None
     try:
         fresh = parse_flow(flow["raw_source"], flow.get("source_format"))
@@ -616,7 +618,7 @@ def _interrupt_scenario_key(interrupt_key: str, step: str | None, base_path: lis
 
 
 def _interrupt_scenarios(graph: dict, interrupts: list) -> tuple[dict | None, list[dict]]:
-    """(base path info, every interrupt scenario) for a modular flow's graph."""
+    """(base path info, every interrupt scenario) for a flow's graph."""
     plan = plan_flow_scenarios({**graph, "interrupts": interrupts}, HARD_MAX_SCENARIOS)
     base = plan["base"]
     base_path = base["path"] if base else []
@@ -667,9 +669,16 @@ def _modular_details(flow: dict) -> dict:
     validation: kind, what the agent asks/says, the field it collects, and the call
     status if it ends there. Plus which steps allow a readback — an ask step whose
     declared field type is date/address, or that declares a `readback` prompt — and the
-    `user.*` record fields the flow's prompts reference."""
+    `user.*` record fields the flow's prompts reference.
+
+    Any other format has none of these step facts, so its details and readback steps are
+    empty: its interrupt scenarios are planned and checked from the graph alone."""
     raw = flow["raw_source"]
     doc = yaml.safe_load(raw)
+    flow_name = str((doc.get("flow_key") if isinstance(doc, dict) else None) or flow.get("name") or "flow")
+    record_fields = sorted(set(_RECORD_FIELD.findall(raw)))
+    if not is_modular_step_flow(doc):
+        return {"details": {}, "readback_steps": set(), "record_fields": record_fields, "flow_name": flow_name}
     lang = doc.get("default_language") or next(iter(doc.get("languages") or []), None)
 
     def text(block):
@@ -694,8 +703,8 @@ def _modular_details(flow: dict) -> dict:
     return {
         "details": details,
         "readback_steps": readback_steps,
-        "record_fields": sorted(set(_RECORD_FIELD.findall(raw))),
-        "flow_name": str(doc.get("flow_key") or flow.get("name") or "flow"),
+        "record_fields": record_fields,
+        "flow_name": flow_name,
     }
 
 
@@ -803,8 +812,8 @@ def preview_flow_scenarios(flow_id: int, body: ScenarioPlanRequest | None = None
         "node_names": {str(n["id"]): str(n.get("name") or n["id"]) for n in graph["nodes"]},
         "scenarios": scenarios,
     }
-    # Modular flows only: the interrupt scenarios and the base path they are built on.
-    # Every other flow's response is exactly as before.
+    # Flows that declare interrupts only: the interrupt scenarios and the base path they
+    # are built on. Every other flow's response is exactly as before.
     if interrupts is not None:
         base_info, interrupt_items = _interrupt_scenarios(graph, interrupts)
         shown = interrupt_items[:body.max_scenarios]

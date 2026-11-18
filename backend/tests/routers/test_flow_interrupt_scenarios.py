@@ -54,6 +54,34 @@ FLOWS = {
     11: _row(11, STORED_NODES, PARSED["edges"][:-1], raw_source=RAW),   # stale stored graph
 }
 
+# A flow in AgentShield's generic `nodes` format (not Maya's modular one) that declares
+# interrupts — planned the same way, from its graph alone.
+GENERIC_RAW = """
+agent: {name: Clinic Bot}
+nodes:
+  - {id: greet, name: Greet, type: say}
+  - {id: ask_name, name: Ask name, type: ask}
+  - {id: ask_reason, name: Ask reason, type: ask}
+  - {id: done, name: Done, type: end}
+edges:
+  - {from: greet, to: ask_name}
+  - {from: ask_name, to: ask_reason}
+  - {from: ask_reason, to: done}
+interrupts:
+  - key: human_request
+    detection: {en: {keywords: ["speak to a person"]}}
+    resume: goto:done
+  - key: hold
+    detection: {en: {keywords: ["hold on"]}}
+    resume: resume
+  - key: wrong_number
+    detection: {en: {keywords: ["wrong number"]}}
+    resume: end
+    end_status: Wrong Number
+"""
+GENERIC = parse_flow(GENERIC_RAW, "yaml")
+FLOWS[12] = _row(12, GENERIC["nodes"], GENERIC["edges"], raw_source=GENERIC_RAW, name="clinic.yaml")
+
 
 class _Table:
     """flow_scenarios in memory with the real UNIQUE (flow_id, scenario_key) semantics."""
@@ -332,3 +360,38 @@ def test_nothing_outside_flow_scenarios_is_touched(client, forbidden):
     client.post(f"/flows/9/scenarios/{ids[0]}/script")
     client.post(f"/flows/9/scenarios/{ids[0]}/run")
     assert forbidden == []
+
+
+# ---------------------------------------------------------------------------
+# A non-modular flow that declares interrupts
+# ---------------------------------------------------------------------------
+def test_generic_flow_with_interrupts_gets_interrupt_scenarios(client):
+    body = _preview(client, 12)
+    by_id = _interrupts(body)
+    assert list(by_id) == ["human_request", "hold", "wrong_number"]
+    assert all(s["plannable"] for s in by_id.values())
+    assert body["base_path"]["path"] == ["greet", "ask_name", "ask_reason", "done"]
+    assert by_id["human_request"]["segments"][1]["target"] == "done"
+    assert body["record_fields"] == []
+
+
+def test_generic_flow_interrupt_script_saves(client, table):
+    item = _interrupts(_preview(client, 12))["wrong_number"]
+    res = client.put(f"/flows/12/scenarios/{item['id']}", json={
+        "test_goal": "Verify the wrong_number interrupt.",
+        "turns": [
+            {"type": "listen", "step": 1, "node_id": "greet",
+             "expected_agent_behavior": "The agent greets the caller."},
+            {"type": "interrupt", "interrupt_key": "wrong_number", "caller_line": "Sorry, wrong number.",
+             "expected_agent_behavior": "The agent ends the call politely."},
+        ],
+        "setup": {"record": {}, "assumed_values": {}},
+        "expectations": {"outcome": "The call ends.", "bug_guards": [], "end_status": "Wrong Number"},
+    })
+    assert res.status_code == 200, res.text
+    assert [t["type"] for t in res.json()["turns"]] == ["listen", "interrupt"]
+
+
+def test_generic_flow_without_interrupts_is_unchanged(client):
+    body = _preview(client, 1)
+    assert "interrupt_scenarios" not in body

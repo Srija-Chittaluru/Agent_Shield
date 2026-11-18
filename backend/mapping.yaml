@@ -1,4 +1,5 @@
-# Internal agent identifier -> the agent's actual / display name.
+# Internal agent identifier -> the agent's actual / display name (`agents`) and what it
+# does (`descriptions`, below).
 #
 # Keys are the identifiers the repo already uses internally:
 #   - `Domain.key` for the agents defined in backend/sample_agents/
@@ -18,3 +19,35 @@ agents:
   telecom_bot: "ConnectWave Mobile Support"
   # backend/sample_rag_bot/main.py -> FastAPI(title=...); also the seeded `agents` row name.
   sample_rag_bot: "Store Customer-Support Agent (RAG)"
+
+# Internal agent identifier -> what the agent does. Seeded as the sample agent's
+# description: it is what scenario generation, the Judge and the fixer know about the
+# agent when no docs are uploaded, so it must describe the agent's actual domain.
+descriptions:
+  banking_bot: >-
+    NorthBank's retail banking support assistant. Answers customer questions about
+    wire/ACH transfer limits, overdraft fees, card replacement, fraud reporting, loan
+    rates, mobile deposits, statements, and support hours.
+  hr_bot: >-
+    PeopleDesk, an internal HR assistant for employees. Answers questions about paid
+    time off, sick and parental leave, the 401(k) match, payroll schedule, remote-work
+    policy, expense reimbursement, and benefits enrollment.
+  insurance_bot: >-
+    SafeGuard's auto and home insurance claims assistant. Answers policyholder questions
+    about claim filing windows, deductibles, claim processing times, roadside
+    assistance, glass repair, rental car coverage, premium grace periods, and total-loss
+    valuation.
+  airline_bot: >-
+    SkyRoute Airways' flight support assistant. Answers passenger questions about
+    carry-on and checked baggage allowances and fees, flight change fees, cancellation and
+    refund rules, check-in and gate cut-off times, seat selection charges, the SkyMiles
+    loyalty programme, and delay compensation.
+  telecom_bot: >-
+    ConnectWave's mobile customer-support assistant. Answers subscriber questions about
+    plan pricing and data allowances, data overage charges, international roaming,
+    billing dates and late-payment fees, SIM and eSIM replacement, contract length and
+    early cancellation, network coverage, and device upgrade eligibility.
+  sample_rag_bot: >-
+    A standalone RAG-based customer-support agent (gpt-4o-mini) for an online store.
+    Answers questions about returns, refunds, shipping, warranty, support hours, orders,
+    cancellations, and payment methods.

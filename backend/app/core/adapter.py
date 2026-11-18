@@ -10,7 +10,14 @@ from typing import Any, Optional
 
 import httpx
 
-from app.config import INVENTORY, SAMPLE_AGENT_URLS, SAMPLE_RAG_BOT_URL, agent_display_name
+from app.config import (
+    AGENT_DESCRIPTIONS,
+    INVENTORY,
+    SAMPLE_AGENT_URLS,
+    SAMPLE_RAG_BOT_URL,
+    agent_description,
+    agent_display_name,
+)
 from app.db import (
     get_agent_by_kind,
     get_agent_by_name,
@@ -32,38 +39,6 @@ DEFAULT_REQUEST_TEMPLATE = '{"message":"{message}","history":{history},"faults":
 # and has no concept of history/faults).
 DEFAULT_QUERY_PARAM_MAP = {"message": "message", "history": "history", "faults": "faults"}
 
-# Domain descriptions for the agents in inventory.yaml. This is the ONLY thing the scenario
-# generator knows about an agent when no docs are uploaded, so a placeholder here means test
-# cases get invented from general knowledge instead of the agent's actual domain.
-SAMPLE_AGENT_DESCRIPTIONS: dict[str, str] = {
-    "banking_bot": (
-        "NorthBank's retail banking support assistant. Answers customer questions about "
-        "wire/ACH transfer limits, overdraft fees, card replacement, fraud reporting, loan "
-        "rates, mobile deposits, statements, and support hours."
-    ),
-    "hr_bot": (
-        "PeopleDesk, an internal HR assistant for employees. Answers questions about paid "
-        "time off, sick and parental leave, the 401(k) match, payroll schedule, remote-work "
-        "policy, expense reimbursement, and benefits enrollment."
-    ),
-    "insurance_bot": (
-        "SafeGuard's auto and home insurance claims assistant. Answers policyholder questions "
-        "about claim filing windows, deductibles, claim processing times, roadside assistance, "
-        "glass repair, rental car coverage, premium grace periods, and total-loss valuation."
-    ),
-    "airline_bot": (
-        "SkyRoute Airways' flight support assistant. Answers passenger questions about "
-        "carry-on and checked baggage allowances and fees, flight change fees, cancellation "
-        "and refund rules, check-in and gate cut-off times, seat selection charges, the "
-        "SkyMiles loyalty programme, and delay compensation."
-    ),
-    "telecom_bot": (
-        "ConnectWave's mobile customer-support assistant. Answers subscriber questions about "
-        "plan pricing and data allowances, data overage charges, international roaming, "
-        "billing dates and late-payment fees, SIM and eSIM replacement, contract length and "
-        "early cancellation, network coverage, and device upgrade eligibility."
-    ),
-}
 # Internal identifier of the sample RAG agent — matches its /health "service" value and
 # its key in mapping.yaml.
 SAMPLE_RAG_BOT_KEY = "sample_rag_bot"
@@ -215,11 +190,8 @@ def seed_sample_agent() -> int:
         endpoint_url=SAMPLE_RAG_BOT_URL,
         response_path="reply",
         request_template=DEFAULT_REQUEST_TEMPLATE,
-        description=(
-            "A standalone RAG-based customer-support agent (gpt-4o-mini) for an online "
-            "store. Answers questions about returns, refunds, shipping, warranty, "
-            "support hours, orders, cancellations, and payment methods."
-        ),
+        # What it does, from backend/mapping.yaml's `descriptions`.
+        description=agent_description(SAMPLE_RAG_BOT_KEY),
     )
 
 
@@ -238,17 +210,17 @@ def seed_inventory() -> int:
         for key in customer["agents"]:
             name = agent_display_name(key)
             agent = get_agent_by_name(name)
-            if agent and key in SAMPLE_AGENT_DESCRIPTIONS:
+            if agent and key in AGENT_DESCRIPTIONS:
                 # Seeding matches on name, so an already-seeded row keeps whatever
-                # description it was created with — refresh it from the map.
-                update_agent_description(agent["id"], SAMPLE_AGENT_DESCRIPTIONS[key])
+                # description it was created with — refresh it from mapping.yaml.
+                update_agent_description(agent["id"], AGENT_DESCRIPTIONS[key])
             agent_id = agent["id"] if agent else insert_agent(
                 name=name,
                 kind="sample",
                 endpoint_url=SAMPLE_AGENT_URLS.get(key, ""),
                 response_path="reply",
                 request_template=DEFAULT_REQUEST_TEMPLATE,
-                description=SAMPLE_AGENT_DESCRIPTIONS.get(key, f"Sample agent '{key}'."),
+                description=agent_description(key),
             )
             get_or_create_customer_agent(customer_id, agent_id)
             pairs += 1

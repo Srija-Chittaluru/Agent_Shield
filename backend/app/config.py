@@ -86,24 +86,32 @@ PUBLIC_BASE_URL: str = os.getenv("PUBLIC_BASE_URL", "")
 MAPPING_PATH: str = os.path.join(os.path.dirname(os.path.dirname(__file__)), "mapping.yaml")
 
 
-def _load_agent_names() -> dict[str, str]:
-    """Read mapping.yaml once at import. A missing/invalid file is non-fatal."""
+def _load_mapping_section(section: str) -> dict[str, str]:
+    """One identifier -> text section of mapping.yaml, read once at import. A
+    missing/invalid file is non-fatal: the section is then empty."""
     try:
         with open(MAPPING_PATH) as f:
             data = yaml.safe_load(f) or {}
-        agents = data.get("agents") or {}
-        return {str(k): str(v) for k, v in agents.items()}
+        entries = data.get(section) or {}
+        return {str(k): str(v) for k, v in entries.items()}
     except Exception as e:
-        print(f"[config] could not read {MAPPING_PATH} ({e}); using internal names as-is")
+        print(f"[config] could not read '{section}' from {MAPPING_PATH} ({e}); it is empty")
         return {}
 
 
-AGENT_NAMES: dict[str, str] = _load_agent_names()
+AGENT_NAMES: dict[str, str] = _load_mapping_section("agents")
+# What each sample agent does — seeded as its `agents.description`.
+AGENT_DESCRIPTIONS: dict[str, str] = _load_mapping_section("descriptions")
 
 
 def agent_display_name(key: str) -> str:
     """The agent's mapped name, falling back to the internal identifier if unmapped."""
     return AGENT_NAMES.get(key, key)
+
+
+def agent_description(key: str) -> str:
+    """The agent's mapped description, with a placeholder if unmapped."""
+    return AGENT_DESCRIPTIONS.get(key, f"Sample agent '{key}'.")
 
 
 # --- Customer inventory (backend/inventory.yaml) -----------------------------

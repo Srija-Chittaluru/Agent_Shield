@@ -573,6 +573,40 @@ def parse_interrupts(raw: dict, step_ids: set[str]) -> tuple[list[dict], list[st
     return interrupts, errors
 
 
+# The step types AgentShield's planner and script checks understand: the caller replies
+# at `ask`, the agent only speaks at `say`, routes internally at `branch`, ends at `end`.
+STEP_TYPES = ("ask", "say", "branch", "end")
+
+
+def apply_step_types(raw: dict, nodes: list[dict]) -> list[str]:
+    """Map a flow's own step type names onto STEP_TYPES, in place; returns errors.
+
+    A flow may declare a top-level `step_types:` object, e.g. {question: ask, message:
+    say, hangup: end}. Each node whose type is a declared name gets the mapped type, and
+    keeps its own name as `source_type`. Nothing is guessed: without the object, every
+    node's type is exactly as before. A declared name no node uses is an error (a typo
+    would otherwise silently leave that step unmapped)."""
+    mapping = raw.get("step_types")
+    if mapping is None:
+        return []
+    if not isinstance(mapping, dict) or not mapping:
+        return ["step_types must be a non-empty object mapping the flow's own step type names to one of: "
+                + ", ".join(STEP_TYPES) + "."]
+    errors = [
+        f"step_types: '{name}' maps to '{target}', which is not one of: {', '.join(STEP_TYPES)}."
+        for name, target in mapping.items() if target not in STEP_TYPES
+    ]
+    used = {n["type"] for n in nodes}
+    errors += [f"step_types: no step has the type '{name}'." for name in mapping if str(name) not in used]
+    if errors:
+        return errors
+    for node in nodes:
+        if node["type"] in mapping:
+            node["source_type"] = node["type"]
+            node["type"] = mapping[node["type"]]
+    return []
+
+
 def _diagnostics(raw: dict) -> dict:
     """What Part-7-style failures show the user instead of a bare "define nodes"
     message: a summary of what IS in the file, so they can see why nothing matched.
@@ -640,6 +674,7 @@ def parse_flow(source_text: str, source_format: Optional[str] = None) -> dict:
         errors.extend(node_errors)
 
     seen_ids = {n["id"] for n in nodes}
+    errors.extend(apply_step_types(raw, nodes))
 
     # Explicit top-level transitions (strict) ...
     raw_edges = raw.get("edges")

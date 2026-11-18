@@ -966,6 +966,9 @@ async def generate_interrupt_script(
     the model with its exact errors, up to INTERRUPT_SCRIPT_ATTEMPTS in all; the
     validator is never relaxed and nothing is repaired here — only a draft that passes
     it is returned, else the last attempt's NodeScriptError is raised."""
+    # Every step's kind comes from the flow's graph (the same kinds the validator checks);
+    # a format with richer per-step details (the modular one) replaces it with those.
+    details = {**{node_id: {"kind": kind} for node_id, kind in node_kinds.items()}, **details}
     messages = [{"role": "user", "content": _build_interrupt_prompt(
         scenario, details, interrupts, record, readback_steps, flow_name, edges,
     )}]

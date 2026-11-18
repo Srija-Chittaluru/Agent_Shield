@@ -81,6 +81,14 @@ interrupts:
 """
 GENERIC = parse_flow(GENERIC_RAW, "yaml")
 FLOWS[12] = _row(12, GENERIC["nodes"], GENERIC["edges"], raw_source=GENERIC_RAW, name="clinic.yaml")
+# The same flow, naming its step types its own way and mapping them with `step_types`.
+OWN_NAMES_RAW = (
+    GENERIC_RAW.replace("type: say", "type: message").replace("type: ask", "type: question")
+    .replace("type: end", "type: hangup")
+    + "step_types: {message: say, question: ask, hangup: end}\n"
+)
+OWN_NAMES = parse_flow(OWN_NAMES_RAW, "yaml")
+FLOWS[13] = _row(13, OWN_NAMES["nodes"], OWN_NAMES["edges"], raw_source=OWN_NAMES_RAW, name="clinic_own.yaml")
 
 
 class _Table:
@@ -395,3 +403,37 @@ def test_generic_flow_interrupt_script_saves(client, table):
 def test_generic_flow_without_interrupts_is_unchanged(client):
     body = _preview(client, 1)
     assert "interrupt_scenarios" not in body
+
+
+# ---------------------------------------------------------------------------
+# A flow with its own step type names (mapped by `step_types`)
+# ---------------------------------------------------------------------------
+def test_own_step_type_names_plan_the_same_interrupt_scenarios(client):
+    own, plain = _interrupts(_preview(client, 13)), _interrupts(_preview(client, 12))
+    assert [(k, s["plannable"], s["path"]) for k, s in own.items()] == \
+        [(k, s["plannable"], s["path"]) for k, s in plain.items()]
+
+
+def test_own_step_type_names_get_a_draft_with_the_right_turns(client, monkeypatch):
+    item = _interrupts(_preview(client, 13))["wrong_number"]
+    prompts = []
+
+    async def chat(system, messages, **kw):
+        prompts.append(messages[0]["content"])
+        return {
+            "test_goal": "Verify the wrong_number interrupt.",
+            "turns": [
+                {"type": "listen", "step": 1, "node_id": "greet",
+                 "expected_agent_behavior": "The agent greets the caller."},
+                {"type": "interrupt", "interrupt_key": "wrong_number", "caller_line": "Sorry, wrong number.",
+                 "expected_agent_behavior": "The agent ends the call politely."},
+            ],
+            "expectations": {"outcome": "The call ends.", "bug_guards": [], "end_status": "Wrong Number"},
+        }
+
+    monkeypatch.setattr(node_script, "chat", chat)
+    res = client.post(f"/flows/13/scenarios/{item['id']}/script")
+    assert res.status_code == 200, res.text
+    # The prompt describes each step by its mapped kind, not as silent routing.
+    assert "STEP 1 [prefix] greet (say)" in prompts[0]
+    assert "turns allowed here: an optional listen turn only" in prompts[0]

@@ -243,3 +243,38 @@ def test_array_of_non_node_like_objects_is_not_a_false_positive():
     raw = {"records": [{"email": "a@example.com"}, {"email": "b@example.com"}]}
     with pytest.raises(FlowAmbiguousError):
         parse_flow(json.dumps(raw), "json")
+
+
+# ---------------------------------------------------------------------------
+# step_types: a flow's own step type names mapped onto ask / say / branch / end.
+# ---------------------------------------------------------------------------
+def _typed_flow(**extra) -> str:
+    return json.dumps({
+        "nodes": [{"id": "a", "name": "A", "type": "message"}, {"id": "b", "name": "B", "type": "question"},
+                  {"id": "c", "name": "C", "type": "hangup"}],
+        "edges": [{"from": "a", "to": "b"}, {"from": "b", "to": "c"}],
+        **extra,
+    })
+
+
+def test_step_types_map_the_flows_own_names_and_keep_them():
+    r = parse_flow(_typed_flow(step_types={"message": "say", "question": "ask", "hangup": "end"}), "json")
+    assert [(n["type"], n["source_type"]) for n in r["nodes"]] == [("say", "message"), ("ask", "question"),
+                                                                  ("end", "hangup")]
+
+
+def test_without_step_types_node_types_are_unchanged():
+    r = parse_flow(_typed_flow(), "json")
+    assert [n["type"] for n in r["nodes"]] == ["message", "question", "hangup"]
+    assert all("source_type" not in n for n in r["nodes"])
+
+
+@pytest.mark.parametrize("step_types, error", [
+    ({"question": "prompt"}, "step_types: 'question' maps to 'prompt', which is not one of: ask, say, branch, end."),
+    ({"questoin": "ask"}, "step_types: no step has the type 'questoin'."),
+    (["ask"], "step_types must be a non-empty object"),
+])
+def test_unusable_step_types_are_rejected(step_types, error):
+    with pytest.raises(FlowParseError) as e:
+        parse_flow(_typed_flow(step_types=step_types), "json")
+    assert any(err.startswith(error) for err in e.value.errors)

@@ -34,6 +34,9 @@ export interface Agent {
   description?: string | null;
 }
 
+// The wire protocols a voice-modality agent can speak (backend app.core.voice_caller).
+export type VoiceProtocol = "http_json" | "websocket" | "native_ws";
+
 export interface RunCounts {
   scenarios: number;
   conversations: number;
@@ -189,7 +192,16 @@ export function registerAgent(body: {
   modality?: "chat" | "voice";
   // Which wire protocol a voice-modality agent speaks. Ignored for chat. Defaults
   // server-side to "http_json" when omitted.
-  voice_protocol?: "http_json" | "native_ws";
+  voice_protocol?: VoiceProtocol;
+  // "POST" (default) or "GET"; GET agents take query_param_map instead of request_template.
+  http_method?: "POST" | "GET";
+  // GET only: JSON mapping "message"/"history"/"faults" to the agent's query parameter names.
+  query_param_map?: string | null;
+  // Whether the agent reports flow signals in its trace. Omitted = keep the stored
+  // value (unset = the Judge decides from each conversation's trace).
+  reports_flow_signals?: boolean | null;
+  // native_ws only: JSON overriding its wire format. Omitted = keep the stored value.
+  protocol_config?: string | null;
 }): Promise<{ agent_id: number }> {
   return req("/agents", { method: "POST", body: JSON.stringify(body) });
 }

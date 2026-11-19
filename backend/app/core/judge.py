@@ -10,6 +10,7 @@ from typing import Any
 from app.core import flow_oracle
 from app.core.adapter import AGENT_ERROR_SENTINEL, SYSTEM_FAULTS
 from app.core.llm import FIXED_SEED, chat
+from app.core.mock_agent import is_mock
 from app.core.node_script import parse_plain_path_script
 from app.db import (
     get_agent,
@@ -321,12 +322,21 @@ AGENT_DESCRIPTION_MAX_CHARS = 1000
 
 def _agent_block(conv: dict) -> str:
     """'AGENT UNDER TEST' prompt section — what the agent does, from its saved description —
-    or "" when it has none, so such a conversation's prompt is unchanged."""
+    or "" when it has none, so such a conversation's prompt is unchanged.
+
+    For a dry run (app.core.mock_agent) it also says the agent was simulated from its
+    system prompt, so the fixer's suggestion is a change to that prompt."""
     agent = _conversation_agent(conv)
     description = str((agent or {}).get("description") or "").strip()
-    if not description:
-        return ""
-    return f"AGENT UNDER TEST\n  {description[:AGENT_DESCRIPTION_MAX_CHARS]}\n\n"
+    block = f"  {description[:AGENT_DESCRIPTION_MAX_CHARS]}\n" if description else ""
+    if is_mock(agent):
+        prompt = str(agent.get("system_prompt") or "").strip()
+        block += (
+            "  DRY RUN: this agent was simulated by an LLM following the system prompt "
+            "below, so any fix should be a change to that system prompt.\n"
+            f"  SYSTEM PROMPT: {prompt[:AGENT_DESCRIPTION_MAX_CHARS] or '(none given)'}\n"
+        )
+    return f"AGENT UNDER TEST\n{block}\n" if block else ""
 
 
 def _reports_flow_signals(conv: dict, traces: list[dict]) -> bool:

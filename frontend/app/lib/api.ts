@@ -32,6 +32,9 @@ export interface Agent {
   endpoint_url: string;
   response_path: string;
   description?: string | null;
+  // Dry run: no endpoint — an LLM plays the agent from its system prompt.
+  simulated?: boolean;
+  system_prompt?: string | null;
 }
 
 // The wire protocols a voice-modality agent can speak (backend app.core.voice_caller).
@@ -147,6 +150,8 @@ export interface Report {
   breakdown: Breakdown | null;
   conversations: Conversation[];
   is_demo?: boolean;
+  // Dry run: the agent was simulated, so these results are a prediction.
+  simulated?: boolean;
 }
 
 // A group report is one Report per agent, each labelled with whose agent it is.
@@ -169,6 +174,7 @@ export interface InventoryAgent {
   customer_agent_id: number | null;
   agent_id: number | null;
   modality: "chat" | "voice";
+  simulated?: boolean;
 }
 
 export interface InventoryCustomer {
@@ -183,7 +189,8 @@ export interface Inventory {
 // ---- calls ----
 export function registerAgent(body: {
   name: string;
-  endpoint_url: string;
+  // Required for a real agent; omitted for a dry run.
+  endpoint_url?: string;
   response_path?: string;
   request_template?: string;
   auth_header?: string | null;
@@ -202,6 +209,9 @@ export function registerAgent(body: {
   reports_flow_signals?: boolean | null;
   // native_ws only: JSON overriding its wire format. Omitted = keep the stored value.
   protocol_config?: string | null;
+  // Dry run: store the agent without an endpoint; an LLM plays it from system_prompt.
+  simulated?: boolean;
+  system_prompt?: string | null;
 }): Promise<{ agent_id: number }> {
   return req("/agents", { method: "POST", body: JSON.stringify(body) });
 }

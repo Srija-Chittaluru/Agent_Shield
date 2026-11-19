@@ -14,6 +14,7 @@ type Combo = {
   customer: string;
   agentKey: string;
   agentName: string;
+  simulated: boolean;
   firstOfCustomer: boolean;
   customerAgentId: number | null;
   agentId: number | null;
@@ -31,6 +32,7 @@ function toCombos(inventory: Inventory, modality: "chat" | "voice"): Combo[] {
       customer: c.name,
       agentKey: a.key,
       agentName: a.name,
+      simulated: !!a.simulated,
       firstOfCustomer: i === 0,
       customerAgentId: a.customer_agent_id,
       agentId: a.agent_id,
@@ -206,7 +208,14 @@ export default function ExistingAgent() {
                     <td className="px-6 py-4 font-medium text-[#F8FAFC]">
                       {combo.customer}
                     </td>
-                    <td className="px-6 py-4 text-[#9CA3AF]">{combo.agentName}</td>
+                    <td className="px-6 py-4 text-[#9CA3AF]">
+                      {combo.agentName}
+                      {combo.simulated && (
+                        <span className="ml-2 rounded-full border border-[#FBBF24]/30 bg-[#FBBF24]/10 px-2 py-0.5 text-[10px] font-medium text-[#FBBF24]">
+                          Dry run
+                        </span>
+                      )}
+                    </td>
                   </tr>
                 ))}
               </tbody>

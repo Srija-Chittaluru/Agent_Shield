@@ -45,6 +45,7 @@ import websockets
 
 from app.core.adapter import AGENT_ERROR_SENTINEL, DEFAULT_TIMEOUT_S, auth_headers, send as http_send
 from app.core.llm import speech_to_text, text_to_speech
+from app.core.mock_agent import is_mock
 
 # Protocols recognized by name but with no transport implementation yet. Kept apart
 # from a genuinely unknown/typo'd value so the two fail with distinguishable messages.
@@ -71,6 +72,10 @@ async def call_voice_agent(
     neither holds any state across turns. Only twilio's persistent call/session
     (Phase 3B) actually uses them.
     """
+    # Dry run: there is no call to place — the stand-in answers as text, the same as chat.
+    if is_mock(agent):
+        return await http_send(agent, message, history, faults)
+
     protocol = agent.get("voice_protocol") or "http_json"
 
     if protocol == "http_json":

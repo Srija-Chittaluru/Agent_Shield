@@ -18,6 +18,7 @@ from app.config import (
     agent_description,
     agent_display_name,
 )
+from app.core.mock_agent import is_mock, simulated_reply
 from app.db import (
     get_agent_by_kind,
     get_agent_by_name,
@@ -150,6 +151,10 @@ async def send(
 
     # Only agent-cooperative faults are forwarded to the agent's own API.
     faults = [f for f in faults if f in AGENT_FAULTS]
+
+    # Dry run: no endpoint — an LLM plays the agent from its system prompt instead.
+    if is_mock(agent):
+        return await simulated_reply(agent, message, history, faults)
 
     response_path = agent.get("response_path") or "reply"
     url = agent.get("endpoint_url")

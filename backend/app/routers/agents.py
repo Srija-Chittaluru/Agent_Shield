@@ -3,6 +3,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from app.core.adapter import AGENT_ERROR_SENTINEL, DEFAULT_REQUEST_TEMPLATE
+from app.core.mock_agent import MOCK_KIND
 from app.db import (
     get_agent,
     get_agent_by_name_and_endpoint,
@@ -18,7 +19,8 @@ router = APIRouter(prefix="/agents", tags=["agents"])
 
 class RegisterAgent(BaseModel):
     name: str
-    endpoint_url: str
+    # Required for a real agent; left empty for a dry run, which has no endpoint.
+    endpoint_url: str = ""
     response_path: str = "reply"
     request_template: str = DEFAULT_REQUEST_TEMPLATE
     auth_header: str | None = None
@@ -41,6 +43,10 @@ class RegisterAgent(BaseModel):
     # Only for voice_protocol="native_ws": JSON object overriding any part of its wire
     # format (see app.core.voice_native_ws.NATIVE_WS_DEFAULTS). None = the defaults.
     protocol_config: str | None = None
+    # Dry run: store the agent as kind="mock" — an LLM plays it from `system_prompt`
+    # (or, without one, its description + knowledge) instead of calling an endpoint.
+    simulated: bool = False
+    system_prompt: str | None = None
 
 
 class AgentKnowledge(BaseModel):
@@ -61,6 +67,8 @@ def _row_to_dict(row) -> dict:
         "reports_flow_signals": r.get("reports_flow_signals"),
         "protocol_config": r.get("protocol_config"),
         "description": r["description"], "created_at": r["created_at"],
+        "simulated": r["kind"] == MOCK_KIND,
+        "system_prompt": r.get("system_prompt"),
         "knowledge_name": r.get("knowledge_name"),
         "knowledge_chars": len(r.get("knowledge") or ""),
     }
@@ -89,6 +97,13 @@ def register(body: RegisterAgent) -> dict:
     http method) is refreshed from this submission too, so correcting a wrong API key or
     protocol on a second attempt actually takes effect instead of being silently discarded.
     """
+    if body.simulated:
+        # A dry-run agent has no endpoint to call. Blank it so re-registering the same
+        # name finds this row again instead of forking a duplicate.
+        body.endpoint_url = ""
+    elif not body.endpoint_url.strip():
+        raise HTTPException(status_code=422, detail="endpoint_url is required (or choose a dry run)")
+
     if body.protocol_config:
         from app.core.voice_native_ws import protocol_config
 
@@ -110,6 +125,7 @@ def register(body: RegisterAgent) -> dict:
             query_param_map=body.query_param_map,
             reports_flow_signals=body.reports_flow_signals,
             protocol_config=body.protocol_config,
+            system_prompt=body.system_prompt,
         )
         if body.description:
             update_agent_description(existing["id"], body.description)
@@ -117,7 +133,7 @@ def register(body: RegisterAgent) -> dict:
 
     agent_id = insert_agent(
         name=body.name,
-        kind="custom",
+        kind=MOCK_KIND if body.simulated else "custom",
         endpoint_url=body.endpoint_url,
         response_path=body.response_path,
         request_template=body.request_template,
@@ -129,6 +145,7 @@ def register(body: RegisterAgent) -> dict:
         query_param_map=body.query_param_map,
         reports_flow_signals=body.reports_flow_signals,
         protocol_config=body.protocol_config,
+        system_prompt=body.system_prompt,
     )
     return {"agent_id": agent_id}
 

@@ -12,6 +12,7 @@ from pydantic import BaseModel
 
 from app.config import AGENT_CONCURRENCY, TEMPORAL_TASK_QUEUE, WORK_CONCURRENCY
 from app.core.activities import prepare_scenarios
+from app.core.mock_agent import is_mock
 from app.core.scenarios import normalize_scenarios
 from app.temporal.client import get_client
 from app.temporal.workflows import AgentTestInput, RunGroupInput, RunGroupWorkflow
@@ -365,6 +366,8 @@ def _report_payload(run: dict) -> dict:
         "reliability_score": run["reliability_score"],
         "breakdown": breakdown,
         "conversations": [c for c in conversations if c],
+        # Dry run: an LLM played the agent, so these results are a prediction.
+        "simulated": is_mock(get_agent(run["agent_id"])),
     }
 
 

@@ -9,6 +9,7 @@ separate testing contexts.
 from fastapi import APIRouter, HTTPException
 
 from app.config import INVENTORY, agent_display_name
+from app.core.mock_agent import MOCK_KIND
 from app.db import get_customer_agent, get_test_cases, list_customer_agents
 
 router = APIRouter(prefix="/inventory", tags=["inventory"])
@@ -51,6 +52,8 @@ def get_inventory() -> dict:
             "customer_agent_id": combo["id"],
             "agent_id": combo["agent_id"],
             "modality": combo["agent_modality"],
+            # Dry-run agents are stored like any connected agent; this lets the UI label them.
+            "simulated": combo["agent_kind"] == MOCK_KIND,
         })
     # dict order follows list_customer_agents()' ORDER BY, i.e. the order they were created.
     customers.extend({"name": name, "agents": agents} for name, agents in dynamic.items())

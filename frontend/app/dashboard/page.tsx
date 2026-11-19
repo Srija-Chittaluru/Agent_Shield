@@ -370,6 +370,10 @@ export default function DashboardPage() {
   // voice, since there's no sample voice agent wired up yet.
   const [agentName, setAgentName] = useState("Store Support Agent (RAG)");
   const [endpointUrl, setEndpointUrl] = useState("http://localhost:8002/chat");
+  // Dry run: no endpoint — an LLM plays the agent from its system prompt, so the report
+  // predicts where it would break before it is ever connected.
+  const [dryRun, setDryRun] = useState(false);
+  const [systemPrompt, setSystemPrompt] = useState("");
   const [apiKey, setApiKey] = useState("");
   const [provider, setProvider] = useState("openai");
   // Voice-modality only: which wire protocol the agent speaks (see VOICE_PROTOCOLS).
@@ -428,7 +432,11 @@ export default function DashboardPage() {
   const combinedKnowledgeName = knowledgeDocs.map((d) => d.name).join(", ");
   // Agent Knowledge is required (both modalities) — satisfied by EITHER an uploaded
   // doc or a non-empty description, never both.
-  const hasKnowledge = combinedKnowledgeText.trim().length > 0 || aboutText.trim().length > 0;
+  // A dry run's system prompt describes the agent too, so it also satisfies it.
+  const hasKnowledge =
+    combinedKnowledgeText.trim().length > 0 ||
+    aboutText.trim().length > 0 ||
+    (dryRun && systemPrompt.trim().length > 0);
 
   const [verifyIndex, setVerifyIndex] = useState(0);
   const [selectedTests, setSelectedTests] = useState<string[]>(
@@ -574,8 +582,9 @@ export default function DashboardPage() {
 
   const canVerify =
     agentName.trim().length > 0 &&
-    endpointUrl.trim().length > 0 &&
-    (modality !== "voice" || voiceProtocol !== "native_ws" || createCallBody.trim().length > 0);
+    (dryRun ||
+      (endpointUrl.trim().length > 0 &&
+        (modality !== "voice" || voiceProtocol !== "native_ws" || createCallBody.trim().length > 0)));
   const canGenerate = selectedTests.length > 0 && !generating;
   const canRunTest = plannedScenarios > 0 && !starting && !generating;
   const aiCount = testCases.filter((c) => c.source === "ai").length;
@@ -590,6 +599,8 @@ export default function DashboardPage() {
     setTargets([]);
     setActiveIdx(0);
     setStep("connect");
+    setDryRun(false);
+    setSystemPrompt("");
     setApiKey("");
     setVoiceProtocol("http_json");
     setCreateCallBody("");
@@ -711,13 +722,39 @@ export default function DashboardPage() {
     })();
   }, []);
 
+  // --- Dry run: store the agent without an endpoint. Nothing to verify, so go on. ---
+  const handleDryRunConnect = async () => {
+    setError(null);
+    try {
+      const { agent_id } = await registerAgent({
+        name: agentName.trim(),
+        simulated: true,
+        system_prompt: systemPrompt.trim() || undefined,
+        description: aboutText.trim() || undefined,
+        modality,
+      });
+      setAgentId(agent_id);
+      if (combinedKnowledgeText.trim()) {
+        await saveAgentKnowledge(agent_id, combinedKnowledgeText, combinedKnowledgeName);
+      }
+      setStep("configure");
+    } catch (e) {
+      setError(`Couldn't set up the dry run: ${(e as Error).message}`);
+    }
+  };
+
   // --- Verify: register + real probe, with a staged animation ---
   const handleVerifyConnection = async () => {
     if (!canVerify) return;
     if (!hasKnowledge) {
-      setError("Agent Knowledge is required. Upload a knowledge file or describe your agent.");
+      setError(
+        dryRun
+          ? "A dry run needs the agent's system prompt, a knowledge file, or a description."
+          : "Agent Knowledge is required. Upload a knowledge file or describe your agent."
+      );
       return;
     }
+    if (dryRun) return handleDryRunConnect();
     const sendsQueryMap = usesHttpAdapter && httpMethod === "GET";
     const sendsProtocolConfig = modality === "voice" && voiceProtocol === "native_ws";
     const advancedError =
@@ -1172,6 +1209,33 @@ export default function DashboardPage() {
                     : "Point AgentShield at any agent's HTTP endpoint. (Prefilled with our sample RAG agent.)"}
                 </p>
 
+                {/* Chosen first: a dry run needs no endpoint, so it changes which fields follow. */}
+                <div className="mt-6 grid grid-cols-2 gap-3">
+                  {(
+                    [
+                      { id: false, label: "Real agent", hint: "Call your agent's endpoint" },
+                      { id: true, label: "Dry run", hint: "No endpoint — simulate it from its prompt" },
+                    ]
+                  ).map((o) => (
+                    <button
+                      key={o.label}
+                      type="button"
+                      onClick={() => setDryRun(o.id)}
+                      className={`rounded-lg border px-4 py-3 text-left transition-all duration-300 ${
+                        dryRun === o.id ? "border-white/50 bg-white/10 shadow-[0_0_20px_rgba(255,255,255,0.15)]" : "border-white/10 bg-white/2 hover:border-white/20"
+                      }`}
+                    >
+                      <span className="block text-sm font-medium text-[#F8FAFC]">{o.label}</span>
+                      <span className="mt-0.5 block text-xs text-slate-500">{o.hint}</span>
+                    </button>
+                  ))}
+                </div>
+                {dryRun && (
+                  <p className="mt-3 text-xs text-[#FBBF24]">
+                    An LLM plays your agent from the instructions below, so the report predicts where it is likely to break. It tests the prompt, not your real agent&apos;s code, tools or latency.
+                  </p>
+                )}
+
                 <div className="mt-8 flex flex-col gap-5">
                   <div>
                     <label className="text-xs font-medium text-[#9CA3AF]">Agent Name</label>
@@ -1181,6 +1245,21 @@ export default function DashboardPage() {
                     </div>
                   </div>
 
+                  {dryRun ? (
+                    <div>
+                      <label className="text-xs font-medium text-[#9CA3AF]">
+                        System Prompt <span className="text-slate-600">(recommended — the closer to your real one, the better the prediction)</span>
+                      </label>
+                      <textarea
+                        value={systemPrompt}
+                        onChange={(e) => setSystemPrompt(e.target.value)}
+                        rows={6}
+                        placeholder="Paste your agent's system prompt / instructions…"
+                        className="mt-2 w-full rounded-lg border border-white/12 bg-white/2 px-4 py-3 text-sm text-[#F8FAFC] outline-none transition-colors focus:border-white/30 placeholder:text-slate-600"
+                      />
+                    </div>
+                  ) : (
+                  <>
                   <div>
                     <label className="text-xs font-medium text-[#9CA3AF]">
                       {modality === "voice" ? "Voice Agent Endpoint URL" : "Endpoint URL"}
@@ -1348,6 +1427,8 @@ export default function DashboardPage() {
                       </div>
                     )}
                   </div>
+                  </>
+                  )}
 
                   <div>
                     <label className="text-xs font-medium text-[#9CA3AF]">
@@ -1407,6 +1488,7 @@ export default function DashboardPage() {
                     )}
                   </div>
 
+                  {!dryRun && (
                   <div>
                     <label className="text-xs font-medium text-[#9CA3AF]">Provider</label>
                     <div className="mt-2 grid grid-cols-2 gap-3 sm:grid-cols-4">
@@ -1427,6 +1509,7 @@ export default function DashboardPage() {
                       })}
                     </div>
                   </div>
+                  )}
                 </div>
 
                 <motion.button
@@ -1437,7 +1520,7 @@ export default function DashboardPage() {
                   disabled={!canVerify}
                   className="mt-8 flex w-full items-center justify-center gap-2 rounded-full border border-white/20 bg-white/4 px-8 py-3.5 text-base font-medium text-[#F8FAFC] backdrop-blur-md transition-all duration-300 hover:border-white/40 hover:bg-white/12 hover:shadow-[0_0_32px_rgba(255,255,255,0.2)] disabled:cursor-not-allowed disabled:opacity-30 disabled:hover:shadow-none"
                 >
-                  Verify Connection
+                  {dryRun ? "Continue to Dry Run" : "Verify Connection"}
                   <ArrowRight className="h-4 w-4" />
                 </motion.button>
 
@@ -1920,6 +2003,11 @@ export default function DashboardPage() {
               {report.is_demo && (
                 <div className="mt-6 rounded-lg border border-[#FBBF24]/30 bg-[#FBBF24]/10 px-4 py-2 text-center text-sm text-[#FBBF24]">
                   ✦ Sample report — pre-baked demo data (works offline)
+                </div>
+              )}
+              {report.simulated && (
+                <div className="mt-6 rounded-lg border border-[#FBBF24]/30 bg-[#FBBF24]/10 px-4 py-2 text-center text-sm text-[#FBBF24]">
+                  ✦ Dry run — predicted results. An LLM played this agent from its prompt; connect the real agent to confirm.
                 </div>
               )}
 

@@ -36,7 +36,7 @@ def init_schema() -> None:
         CREATE TABLE IF NOT EXISTS agents (
             id                SERIAL PRIMARY KEY,
             name              TEXT NOT NULL,
-            kind              TEXT NOT NULL,          -- sample | custom
+            kind              TEXT NOT NULL,          -- sample | custom | mock (dry run)
             endpoint_url      TEXT,
             auth_header       TEXT,
             request_template  TEXT,                   -- JSON string w/ {message},{history},{faults}
@@ -171,6 +171,10 @@ def init_schema() -> None:
         -- of that transport's wire format (paths, field names, message types). NULL =
         -- the defaults, app.core.voice_native_ws.NATIVE_WS_DEFAULTS.
         ALTER TABLE agents ADD COLUMN IF NOT EXISTS protocol_config TEXT;
+
+        -- Dry run (kind='mock'): the agent's own system prompt, which an LLM plays it
+        -- from in place of an endpoint (see app.core.mock_agent). NULL for every other agent.
+        ALTER TABLE agents ADD COLUMN IF NOT EXISTS system_prompt TEXT;
 
         -- Idempotency, so a re-executed unit of work converges on the same rows instead
         -- of appending new ones. This is the precondition for turning on retries.
@@ -340,17 +344,20 @@ def insert_agent(
     query_param_map: str | None = None,
     reports_flow_signals: bool | None = None,
     protocol_config: str | None = None,
+    system_prompt: str | None = None,
 ) -> int:
     conn = get_conn()
     cur = conn.execute(
         """INSERT INTO agents
            (name, kind, endpoint_url, auth_header, request_template,
             response_path, description, created_at, modality, voice_protocol,
-            http_method, query_param_map, reports_flow_signals, protocol_config)
-           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+            http_method, query_param_map, reports_flow_signals, protocol_config,
+            system_prompt)
+           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
         (name, kind, endpoint_url, auth_header, request_template,
          response_path, description, now_iso(), modality, voice_protocol,
-         http_method, query_param_map, reports_flow_signals, protocol_config),
+         http_method, query_param_map, reports_flow_signals, protocol_config,
+         system_prompt),
     )
     agent_id = cur.fetchone()["id"]
     conn.commit()
@@ -369,6 +376,7 @@ def update_agent_connection(
     query_param_map: str | None,
     reports_flow_signals: bool | None = None,
     protocol_config: str | None = None,
+    system_prompt: str | None = None,
 ) -> None:
     """Refresh a re-registered agent's connection details in place.
 
@@ -379,19 +387,21 @@ def update_agent_connection(
     API key or protocol typed on attempt 1 stuck around forever no matter how many
     times the form was resubmitted. This makes every reconnect attempt authoritative.
 
-    reports_flow_signals and protocol_config are the exception: None (not sent — the
-    Connect form never sends them) keeps the stored value, so reconnecting never erases
-    a declared setting. (protocol_config '{}' resets to the defaults.)
+    reports_flow_signals, protocol_config and system_prompt are the exception: None (not
+    sent) keeps the stored value, so reconnecting never erases a declared setting.
+    (protocol_config '{}' resets to the defaults.)
     """
     conn = get_conn()
     conn.execute(
         """UPDATE agents SET auth_header = %s, request_template = %s, response_path = %s,
            modality = %s, voice_protocol = %s, http_method = %s, query_param_map = %s,
            reports_flow_signals = COALESCE(%s, reports_flow_signals),
-           protocol_config = COALESCE(%s, protocol_config)
+           protocol_config = COALESCE(%s, protocol_config),
+           system_prompt = COALESCE(%s, system_prompt)
            WHERE id = %s""",
         (auth_header, request_template, response_path, modality, voice_protocol,
-         http_method, query_param_map, reports_flow_signals, protocol_config, agent_id),
+         http_method, query_param_map, reports_flow_signals, protocol_config,
+         system_prompt, agent_id),
     )
     conn.commit()
     conn.close()
@@ -831,11 +841,12 @@ def get_or_create_customer_agent(customer_id: int, agent_id: int) -> int:
 
 
 def list_customer_agents() -> list[dict]:
-    """Every customer-agent combination, with the customer, agent names, and modality joined in."""
+    """Every customer-agent combination, with the customer, agent names, modality and kind joined in."""
     conn = get_conn()
     rows = conn.execute(
         """SELECT ca.id, ca.customer_id, ca.agent_id,
-                  c.name AS customer_name, a.name AS agent_name, a.modality AS agent_modality
+                  c.name AS customer_name, a.name AS agent_name, a.modality AS agent_modality,
+                  a.kind AS agent_kind
            FROM customer_agents ca
            JOIN customers c ON c.id = ca.customer_id
            JOIN agents a    ON a.id = ca.agent_id
